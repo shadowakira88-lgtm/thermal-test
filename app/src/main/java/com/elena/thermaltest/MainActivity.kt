@@ -2,92 +2,136 @@ package com.elena.thermaltest
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.hardware.camera2.CameraAccessException
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Paint
 import android.hardware.camera2.CameraCaptureSession
-import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
-import android.hardware.camera2.CaptureResult
-import android.hardware.camera2.TotalCaptureResult
-import android.media.Image
 import android.media.ImageReader
-import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.provider.MediaStore
+import android.text.InputType
+import android.view.MotionEvent
 import android.view.View
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
-import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.Spinner
 import android.widget.TextView
+import android.widget.Toast
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
+import java.util.Arrays
 import java.util.Date
 import java.util.Locale
-import java.util.zip.ZipEntry
-import java.util.zip.ZipOutputStream
+import kotlin.math.abs
+import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
+
+/** Paparan thermal: lukis bitmap + titik suhu. Semua logik ada dalam MainActivity. */
+class ThermalView(a: MainActivity) : View(a) {
+    private val act = a
+    override fun onDraw(canvas: Canvas) {
+        act.render(canvas, width, height, false, 0)
+    }
+    override fun onTouchEvent(e: MotionEvent): Boolean = act.handleTouch(this, e)
+}
 
 /**
- * Ujian: buka kamera thermal dalaman (Camera2 ID 2 pada Ulefone Armor Pad 4 Ultra),
- * tunjuk frame mentah, dan simpan frame + maklumat penuh ke ZIP dalam Download/ThermalTest.
+ * Thermal Elena v1: baca data mentah 16-bit dari kamera ID 2 (YUY2 160x120),
+ * betulkan corak tetap (NUC satu titik), kalibrasi linear sendiri ke deg C,
+ * letak titik suhu dan bakar nilainya ke dalam PNG.
  */
 class MainActivity : Activity() {
-    // v0.2: lalai kepada YUY2 160x120 (format yang ThermVue guna untuk modul thermal)
 
-    private data class Option(val format: Int, val w: Int, val h: Int) {
-        override fun toString() = "${formatName(format)}  ${w}x$h"
+    companion object {
+        const val W = 160
+        const val H = 120
+        const val MAXP = 6
+        const val FLAT_N = 40
     }
 
-    private lateinit var idEdit: EditText
-    private lateinit var spinner: Spinner
-    private lateinit var statusText: TextView
-    private lateinit var imageView: ImageView
-    private lateinit var logText: TextView
+    private val lock = Any()
 
+    // data
+    private val offset = FloatArray(W * H)
+    private val smooth = FloatArray(W * H)
+    private val tmp = FloatArray(W * H)
+    private val fixed = FloatArray(W * H)
+    private val sortBuf = FloatArray(W * H)
+    private val pix = IntArray(W * H)
+    private val rawBuf = IntArray(W * H)
+    private val flatAcc = FloatArray(W * H)
+    private var smoothInit = false
+    private var hasNuc = false
+    private var flatLeft = 0
+    private var rangeInit = false
+    private var rLo = 0f
+    private var rHi = 1f
+    private var bmp: Bitmap? = null
+
+    // titik + kalibrasi
+    private val points = ArrayList<FloatArray>()
+    private var selected = -1
+    private val samples = ArrayList<FloatArray>() // [counts, suhu]
+    private var calA = 0f
+    private var calB = 0f
+    private var calValid = false
+    @Volatile private var rot = 0
+
+    // paparan
+    private lateinit var thermalView: ThermalView
+    private lateinit var statusText: TextView
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var density = 1f
+    private var lastStatus = 0L
+
+    // kamera
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
-
     private var camera: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
-    private var options: List<Option> = emptyList()
-    private var currentOption: Option? = null
 
-    @Volatile private var lastResult: TotalCaptureResult? = null
-    @Volatile private var framesToSave = 0
-    private val savedFrames = ArrayList<Pair<String, ByteArray>>()
-    private val logBuf = StringBuilder()
-    private var frameCounter = 0L
-    private var lastUiUpdate = 0L
+    private val lut = IntArray(256)
+
+    private val paintLine = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val paintText = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val paintBg = Paint()
+    private val paintBmp = Paint(Paint.FILTER_BITMAP_FLAG)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        density = resources.displayMetrics.density
+        buildLut()
+        loadState()
         buildUi()
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
-        } else {
-            loadOptions()
         }
     }
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, res: IntArray) {
-        if (res.isNotEmpty() && res[0] == PackageManager.PERMISSION_GRANTED) loadOptions()
-        else log("Kebenaran kamera ditolak.")
+        if (res.isNotEmpty() && res[0] == PackageManager.PERMISSION_GRANTED) startCamera()
+        else toast("Kebenaran kamera diperlukan.")
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
     }
 
     override fun onPause() {
@@ -98,121 +142,194 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ UI
 
     private fun buildUi() {
-        val pad = (12 * resources.displayMetrics.density).toInt()
+        val pad = (8 * density).toInt()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
         }
-
-        val row1 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row1.addView(TextView(this).apply { text = "Camera ID: " })
-        idEdit = EditText(this).apply { setText("2"); minEms = 3 }
-        row1.addView(idEdit)
-        val btnLoad = Button(this).apply { text = "Muat format"; setOnClickListener { loadOptions() } }
-        row1.addView(btnLoad)
-        root.addView(row1)
-
-        spinner = Spinner(this)
-        spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                currentOption = options.getOrNull(pos)
-            }
-            override fun onNothingSelected(p: AdapterView<*>?) {}
-        }
-        root.addView(spinner)
-
-        val row2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        row2.addView(Button(this).apply { text = "Mula"; setOnClickListener { startCamera() } })
-        row2.addView(Button(this).apply { text = "Henti"; setOnClickListener { stopCamera() } })
-        row2.addView(Button(this).apply { text = "Simpan ZIP"; setOnClickListener { requestSave() } })
-        root.addView(row2)
-
-        statusText = TextView(this).apply { text = "Sedia." }
+        statusText = TextView(this).apply { textSize = 12f; text = "Memulakan..." }
         root.addView(statusText)
 
-        imageView = ImageView(this).apply {
-            adjustViewBounds = true
-            scaleType = ImageView.ScaleType.FIT_CENTER
-            setBackgroundColor(0xFF222222.toInt())
-        }
-        root.addView(imageView, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, (320 * resources.displayMetrics.density).toInt()))
-
-        logText = TextView(this).apply { textSize = 11f }
-        val scroll = ScrollView(this)
-        scroll.addView(logText)
-        root.addView(scroll, LinearLayout.LayoutParams(
+        thermalView = ThermalView(this)
+        root.addView(thermalView, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
+        fun row(vararg items: Pair<String, () -> Unit>): LinearLayout {
+            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for ((label, action) in items) {
+                val b = Button(this).apply {
+                    text = label
+                    textSize = 12f
+                    isAllCaps = false
+                    setOnClickListener { action() }
+                }
+                r.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            }
+            return r
+        }
+        root.addView(row(
+            "Rata (NUC)" to { askFlat() },
+            "Kalibrasi" to { askCalibrate() },
+            "Putar" to { rot = (rot + 1) % 4; saveState(); thermalView.invalidate() }
+        ))
+        root.addView(row(
+            "Simpan PNG" to { savePng() },
+            "Reset titik" to { resetPoints() },
+            "Reset kalib" to { resetCalibration() }
+        ))
         setContentView(root)
     }
 
-    private fun log(s: String) {
-        val line = "[" + SimpleDateFormat("HH:mm:ss", Locale.US).format(Date()) + "] " + s
-        synchronized(logBuf) { logBuf.append(line).append('\n') }
-        mainHandler.post { logText.text = synchronized(logBuf) { logBuf.toString() } }
+    private fun toast(s: String) {
+        mainHandler.post { Toast.makeText(this, s, Toast.LENGTH_LONG).show() }
     }
 
-    private fun setStatus(s: String) = mainHandler.post { statusText.text = s }
+    private fun resetPoints() {
+        synchronized(lock) { points.clear(); selected = -1 }
+        thermalView.invalidate()
+        updateStatus()
+    }
 
-    // ------------------------------------------------------------------ options
+    private fun resetCalibration() {
+        synchronized(lock) { samples.clear(); calValid = false }
+        saveState()
+        updateStatus()
+        thermalView.invalidate()
+    }
 
-    private fun loadOptions() {
-        try {
-            val mgr = getSystemService(CAMERA_SERVICE) as CameraManager
-            log("Senarai camera ID: " + mgr.cameraIdList.joinToString())
-            val id = idEdit.text.toString().trim()
-            val ch = mgr.getCameraCharacteristics(id)
-            val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-            val list = ArrayList<Option>()
-            if (map != null) {
-                for (f in map.outputFormats) {
-                    if (f == 34 /* PRIVATE: tak boleh dibaca */) continue
-                    val sizes = map.getOutputSizes(f) ?: continue
-                    for (s in sizes) list.add(Option(f, s.width, s.height))
-                }
+    private fun askFlat() {
+        AlertDialog.Builder(this)
+            .setTitle("Betulkan corak tetap (NUC)")
+            .setMessage("Tutup lensa thermal dengan permukaan rata dan seragam (kad atau kertas tebal, rapat), " +
+                "kemudian tekan Mula. App rakam $FLAT_N frame. Jangan gerakkan.")
+            .setPositiveButton("Mula") { _, _ ->
+                synchronized(lock) { java.util.Arrays.fill(flatAcc, 0f); flatLeft = FLAT_N }
+                toast("Merakam rujukan...")
             }
-            options = list.sortedWith(compareBy({ if (it.format == 20) 0 else if (it.format == 35) 1 else 2 }, { it.format }, { -it.w }))
-            spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, options)
-            currentOption = options.firstOrNull()
-            log("Camera $id: ${options.size} pilihan format/saiz dijumpai.")
-        } catch (e: Exception) {
-            log("loadOptions gagal: $e")
+            .setNegativeButton("Batal", null)
+            .show()
+    }
+
+    private fun askCalibrate() {
+        val sel = synchronized(lock) { selected }
+        if (sel < 0 || sel >= synchronized(lock) { points.size }) {
+            toast("Ketik imej untuk letak titik, pilih satu titik, kemudian tekan Kalibrasi.")
+            return
+        }
+        val input = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or
+                InputType.TYPE_NUMBER_FLAG_SIGNED
+            hint = "cth 33.2"
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Suhu sebenar di P${sel + 1} (deg C)")
+            .setMessage("Guna bacaan ThermVue atau termometer pada tempat yang sama. " +
+                "Perlu sekurang-kurangnya 2 sampel pada suhu berbeza.")
+            .setView(input)
+            .setPositiveButton("Tambah") { _, _ ->
+                val t = input.text.toString().toFloatOrNull()
+                if (t == null) { toast("Nombor tak sah."); return@setPositiveButton }
+                synchronized(lock) {
+                    if (sel < points.size) {
+                        val c = countsAtLocked(points[sel][0], points[sel][1])
+                        samples.add(floatArrayOf(c, t))
+                        refitLocked()
+                    }
+                }
+                saveState()
+                updateStatus()
+                thermalView.invalidate()
+            }
+            .setNegativeButton("Batal", null)
+            .show()
+    }
+
+    // ------------------------------------------------------------------ kalibrasi
+
+    private fun countsAtLocked(x: Float, y: Float): Float {
+        val cx = x.toInt().coerceIn(1, W - 2)
+        val cy = y.toInt().coerceIn(1, H - 2)
+        var s = 0f
+        for (dy in -1..1) for (dx in -1..1) s += smooth[(cy + dy) * W + (cx + dx)]
+        return s / 9f
+    }
+
+    private fun refitLocked() {
+        calValid = false
+        val n = samples.size
+        if (n < 2) return
+        var sx = 0.0; var sy = 0.0
+        for (s in samples) { sx += s[0]; sy += s[1] }
+        val mx = sx / n; val my = sy / n
+        var sxx = 0.0; var sxy = 0.0
+        for (s in samples) { sxx += (s[0] - mx) * (s[0] - mx); sxy += (s[0] - mx) * (s[1] - my) }
+        if (sxx < 400.0) return // counts terlalu dekat antara sampel
+        val a = sxy / sxx
+        calA = a.toFloat()
+        calB = (my - a * mx).toFloat()
+        calValid = true
+    }
+
+    private fun tempFromCounts(c: Float): Float = calA * c + calB
+
+    // ------------------------------------------------------------------ simpan / muat
+
+    private fun loadState() {
+        val sp = getSharedPreferences("thermal", MODE_PRIVATE)
+        rot = sp.getInt("rot", 0)
+        val s = sp.getString("samples", "") ?: ""
+        for (part in s.split(";")) {
+            val ab = part.split("|")
+            if (ab.size == 2) {
+                val c = ab[0].toFloatOrNull(); val t = ab[1].toFloatOrNull()
+                if (c != null && t != null) samples.add(floatArrayOf(c, t))
+            }
+        }
+        refitLocked()
+        val f = File(filesDir, "nuc.bin")
+        if (f.exists() && f.length() == (W * H * 4).toLong()) {
+            val bb = ByteBuffer.wrap(f.readBytes()).order(ByteOrder.LITTLE_ENDIAN)
+            for (i in offset.indices) offset[i] = bb.getFloat()
+            hasNuc = true
         }
     }
 
-    // ------------------------------------------------------------------ camera
+    private fun saveState() {
+        val sb = StringBuilder()
+        synchronized(lock) { for (s in samples) sb.append(s[0]).append('|').append(s[1]).append(';') }
+        getSharedPreferences("thermal", MODE_PRIVATE).edit()
+            .putInt("rot", rot).putString("samples", sb.toString()).apply()
+    }
+
+    private fun saveNuc() {
+        try {
+            val bb = ByteBuffer.allocate(W * H * 4).order(ByteOrder.LITTLE_ENDIAN)
+            for (v in offset) bb.putFloat(v)
+            File(filesDir, "nuc.bin").writeBytes(bb.array())
+        } catch (_: Exception) {}
+    }
+
+    // ------------------------------------------------------------------ kamera
 
     private fun startCamera() {
-        stopCamera()
-        val opt = currentOption
-        if (opt == null) { log("Tiada format dipilih."); return }
-        val id = idEdit.text.toString().trim()
+        if (camera != null) return
         thread = HandlerThread("cam").also { it.start() }
         handler = Handler(thread!!.looper)
-        frameCounter = 0
-
-        val rd = ImageReader.newInstance(opt.w, opt.h, opt.format, 4)
+        val rd = ImageReader.newInstance(W, H, 20 /* YUY2 */, 3)
         reader = rd
-        rd.setOnImageAvailableListener({ r -> onImage(r, opt) }, handler)
-
+        rd.setOnImageAvailableListener({ r -> onImage(r) }, handler)
         val mgr = getSystemService(CAMERA_SERVICE) as CameraManager
         try {
-            log("Buka camera $id dengan ${opt}")
-            mgr.openCamera(id, object : CameraDevice.StateCallback() {
-                override fun onOpened(cd: CameraDevice) {
-                    camera = cd
-                    createSession(cd, rd)
+            mgr.openCamera("2", object : CameraDevice.StateCallback() {
+                override fun onOpened(cd: CameraDevice) { camera = cd; createSession(cd, rd) }
+                override fun onDisconnected(cd: CameraDevice) { cd.close(); camera = null }
+                override fun onError(cd: CameraDevice, error: Int) {
+                    cd.close(); camera = null
+                    toast("Ralat kamera thermal: $error")
                 }
-                override fun onDisconnected(cd: CameraDevice) { log("Camera disconnected"); cd.close() }
-                override fun onError(cd: CameraDevice, error: Int) { log("Camera error code=$error"); cd.close() }
             }, handler)
-        } catch (e: SecurityException) {
-            log("SecurityException: $e")
-        } catch (e: CameraAccessException) {
-            log("CameraAccessException: $e")
         } catch (e: Exception) {
-            log("openCamera gagal: $e")
+            toast("Gagal buka kamera thermal: $e")
         }
     }
 
@@ -225,21 +342,12 @@ class MainActivity : Activity() {
                     try {
                         val req = cd.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                         req.addTarget(rd.surface)
-                        s.setRepeatingRequest(req.build(), object : CameraCaptureSession.CaptureCallback() {
-                            override fun onCaptureCompleted(
-                                sess: CameraCaptureSession, rq: CaptureRequest, result: TotalCaptureResult
-                            ) { lastResult = result }
-                        }, handler)
-                        log("Streaming bermula.")
-                    } catch (e: Exception) {
-                        log("setRepeatingRequest gagal: $e")
-                    }
+                        s.setRepeatingRequest(req.build(), null, handler)
+                    } catch (e: Exception) { toast("Gagal mula streaming: $e") }
                 }
-                override fun onConfigureFailed(s: CameraCaptureSession) { log("Konfigurasi session GAGAL") }
+                override fun onConfigureFailed(s: CameraCaptureSession) { toast("Konfigurasi kamera gagal") }
             }, handler)
-        } catch (e: Exception) {
-            log("createCaptureSession gagal: $e")
-        }
+        } catch (e: Exception) { toast("Gagal cipta sesi: $e") }
     }
 
     private fun stopCamera() {
@@ -250,251 +358,265 @@ class MainActivity : Activity() {
         thread?.quitSafely(); thread = null; handler = null
     }
 
-    // ------------------------------------------------------------------ frames
-
-    private fun onImage(r: ImageReader, opt: Option) {
-        val img: Image = try { r.acquireLatestImage() } catch (e: Exception) { null } ?: return
+    private fun onImage(r: ImageReader) {
+        val img = try { r.acquireLatestImage() } catch (e: Exception) { null } ?: return
         try {
-            frameCounter++
-            val bmp = toBitmap(img, opt)
-
-            if (framesToSave > 0) {
-                val idx = 5 - framesToSave
-                val planes = img.planes
-                for (pi in planes.indices) {
-                    val b = planes[pi].buffer.duplicate()
-                    b.rewind()
-                    val bytes = ByteArray(b.remaining())
-                    b.get(bytes)
-                    val info = "rowStride=${planes[pi].rowStride} pixelStride=${planes[pi].pixelStride}"
-                    log("frame$idx plane$pi: ${bytes.size} bytes, $info")
-                    savedFrames.add("frame${idx}_plane$pi.bin" to bytes)
-                }
-                framesToSave--
-                if (framesToSave == 0) writeZip()
+            val p = img.planes[0]
+            val buf = p.buffer.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+            val rs = p.rowStride
+            val ps = p.pixelStride
+            for (y in 0 until H) for (x in 0 until W) {
+                val pos = y * rs + x * ps
+                rawBuf[y * W + x] = if (pos + 1 < buf.limit()) (buf.getShort(pos).toInt() and 0xFFFF) else 0
             }
-
+            processFrame(rawBuf)
+            thermalView.postInvalidate()
             val now = System.currentTimeMillis()
-            if (bmp != null && now - lastUiUpdate > 100) {
-                lastUiUpdate = now
-                mainHandler.post { imageView.setImageBitmap(bmp) }
-            }
-        } catch (e: Exception) {
-            log("onImage ralat: $e")
+            if (now - lastStatus > 250) { lastStatus = now; updateStatus() }
+        } catch (_: Exception) {
         } finally {
             img.close()
         }
     }
 
-    /** Tukar frame kepada bitmap kelabu (auto-kontras) supaya nampak apa data mentah tu. */
-    private fun toBitmap(img: Image, opt: Option): Bitmap? {
-        val w = img.width
-        val h = img.height
-        val planes = img.planes
-        if (planes.isEmpty()) return null
-        val p0 = planes[0]
-        val buf = p0.buffer.duplicate()
-        buf.rewind()
-        val rs = p0.rowStride
-        val ps = p0.pixelStride
+    // ------------------------------------------------------------------ pemprosesan
 
-        if (opt.format == 256) { // JPEG
-            val b = ByteArray(buf.remaining()); buf.get(b)
-            return BitmapFactory.decodeByteArray(b, 0, b.size)
-        }
-
-        val is16 = opt.format == 540422489 /* Y16 */ || opt.format == 32 /* RAW_SENSOR */ ||
-            opt.format == 20 /* YUY2: ThermVue guna ini, data suhu 16-bit */
-        val vals = IntArray(w * h)
-        var mn = Int.MAX_VALUE
-        var mx = Int.MIN_VALUE
-        if (is16) {
-            buf.order(ByteOrder.LITTLE_ENDIAN)
-            for (y in 0 until h) for (x in 0 until w) {
-                val pos = y * rs + x * 2
-                if (pos + 1 >= buf.limit()) continue
-                val v = buf.getShort(pos).toInt() and 0xFFFF
-                vals[y * w + x] = v
-                if (v < mn) mn = v
-                if (v > mx) mx = v
-            }
-        } else {
-            for (y in 0 until h) for (x in 0 until w) {
-                val pos = y * rs + x * ps
-                if (pos >= buf.limit()) continue
-                val v = buf.get(pos).toInt() and 0xFF
-                vals[y * w + x] = v
-                if (v < mn) mn = v
-                if (v > mx) mx = v
-            }
-        }
-        val range = (mx - mn).coerceAtLeast(1)
-        val px = IntArray(w * h)
-        for (i in px.indices) {
-            val g = ((vals[i] - mn) * 255L / range).toInt()
-            px[i] = (0xFF shl 24) or (g shl 16) or (g shl 8) or g
-        }
-        setStatus("Frame #$frameCounter  ${opt}  min=$mn max=$mx  planes=${planes.size}")
-        return Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
-    }
-
-    // ------------------------------------------------------------------ simpan
-
-    private fun requestSave() {
-        if (camera != null && reader != null) {
-            savedFrames.clear()
-            framesToSave = 5
-            log("Akan simpan 5 frame seterusnya...")
-        } else {
-            log("Kamera tak berjalan, simpan maklumat sahaja.")
-            writeZip()
+    private fun buildLut() {
+        val stops = arrayOf(
+            floatArrayOf(0.00f, 0f, 0f, 30f),
+            floatArrayOf(0.25f, 90f, 0f, 140f),
+            floatArrayOf(0.50f, 210f, 30f, 50f),
+            floatArrayOf(0.75f, 255f, 150f, 0f),
+            floatArrayOf(0.90f, 255f, 230f, 80f),
+            floatArrayOf(1.00f, 255f, 255f, 255f)
+        )
+        for (i in 0 until 256) {
+            val t = i / 255f
+            var k = 0
+            while (k < stops.size - 2 && t > stops[k + 1][0]) k++
+            val a = stops[k]; val b = stops[k + 1]
+            val f = ((t - a[0]) / (b[0] - a[0])).coerceIn(0f, 1f)
+            val r = (a[1] + (b[1] - a[1]) * f).toInt()
+            val g = (a[2] + (b[2] - a[2]) * f).toInt()
+            val bl = (a[3] + (b[3] - a[3]) * f).toInt()
+            lut[i] = Color.rgb(r, g, bl)
         }
     }
 
-    private fun writeZip() {
+    private fun finishFlatLocked() {
+        var sum = 0.0
+        for (v in flatAcc) sum += v
+        val mean = (sum / flatAcc.size / FLAT_N).toFloat()
+        for (i in offset.indices) offset[i] = flatAcc[i] / FLAT_N - mean
+        hasNuc = true
+        smoothInit = false
+        saveNuc()
+        toast("NUC siap. Corak tetap dibetulkan.")
+    }
+
+    private fun processFrame(raw: IntArray) {
+        synchronized(lock) {
+            // baris pertama ialah artifak sensor: salin dari baris kedua
+            System.arraycopy(raw, W, raw, 0, W)
+            if (flatLeft > 0) {
+                for (i in raw.indices) flatAcc[i] += raw[i].toFloat()
+                flatLeft--
+                if (flatLeft == 0) finishFlatLocked()
+            }
+            for (i in raw.indices) tmp[i] = raw[i] - offset[i]
+            System.arraycopy(tmp, 0, fixed, 0, tmp.size)
+            // piksel rosak: ganti dengan purata jiran jika terpencil
+            for (y in 1 until H - 1) for (x in 1 until W - 1) {
+                val i = y * W + x
+                val m = (tmp[i - 1] + tmp[i + 1] + tmp[i - W] + tmp[i + W] +
+                    tmp[i - W - 1] + tmp[i - W + 1] + tmp[i + W - 1] + tmp[i + W + 1]) / 8f
+                if (abs(tmp[i] - m) > 900f) fixed[i] = m
+            }
+            if (!smoothInit) {
+                System.arraycopy(fixed, 0, smooth, 0, fixed.size)
+                smoothInit = true
+            } else {
+                for (i in smooth.indices) smooth[i] += 0.35f * (fixed[i] - smooth[i])
+            }
+            System.arraycopy(smooth, 0, sortBuf, 0, smooth.size)
+            Arrays.sort(sortBuf)
+            var lo = sortBuf[(sortBuf.size * 0.01f).toInt()]
+            var hi = sortBuf[(sortBuf.size * 0.99f).toInt()]
+            if (hi - lo < 80f) { val c = (hi + lo) / 2f; lo = c - 40f; hi = c + 40f }
+            if (!rangeInit) { rLo = lo; rHi = hi; rangeInit = true }
+            else { rLo += 0.2f * (lo - rLo); rHi += 0.2f * (hi - rHi) }
+            val span = max(1f, rHi - rLo)
+            for (i in pix.indices) {
+                val idx = (((smooth[i] - rLo) / span) * 255f).toInt().coerceIn(0, 255)
+                pix[i] = lut[idx]
+            }
+            bmp = Bitmap.createBitmap(pix, W, H, Bitmap.Config.ARGB_8888)
+        }
+    }
+
+    // ------------------------------------------------------------------ lukisan
+
+    private fun fitMatrix(w: Int, availH: Int): Matrix {
+        val r = rot
+        val m = Matrix()
+        m.postTranslate(-W / 2f, -H / 2f)
+        m.postRotate(r * 90f)
+        val rw = if (r % 2 == 0) W else H
+        val rh = if (r % 2 == 0) H else W
+        val s = min(w.toFloat() / rw, availH.toFloat() / rh)
+        m.postScale(s, s)
+        m.postTranslate(w / 2f, availH / 2f)
+        return m
+    }
+
+    private fun statsLineLocked(): String {
+        var mn = Float.MAX_VALUE; var mxv = -Float.MAX_VALUE
+        for (y in 1 until H - 1) for (x in 1 until W - 1) {
+            val v = smooth[y * W + x]
+            if (v < mn) mn = v
+            if (v > mxv) mxv = v
+        }
+        return if (calValid) {
+            val a = tempFromCounts(mn); val b = tempFromCounts(mxv)
+            String.format(Locale.US, "Min %.1f  Max %.1f C", min(a, b), max(a, b))
+        } else {
+            "Belum dikalibrasi (nilai mentah)"
+        }
+    }
+
+    fun render(canvas: Canvas, w: Int, h: Int, forSave: Boolean, strip: Int) {
+        canvas.drawColor(Color.BLACK)
+        val b = synchronized(lock) { bmp } ?: return
+        val m = fitMatrix(w, h - strip)
+        canvas.drawBitmap(b, m, paintBmp)
+
+        val ts = if (forSave) max(16f, w / 30f) else 14f * density
+        paintText.textSize = ts
+        paintText.typeface = android.graphics.Typeface.DEFAULT_BOLD
+        paintLine.style = Paint.Style.STROKE
+        paintBg.color = Color.argb(170, 0, 0, 0)
+        val arm = ts * 0.8f
+
+        val labels = ArrayList<String>()
+        val pts = ArrayList<FloatArray>()
+        var selIdx = -1
+        var stats = ""
+        synchronized(lock) {
+            selIdx = selected
+            for ((i, p) in points.withIndex()) {
+                val c = countsAtLocked(p[0], p[1])
+                labels.add(if (calValid) String.format(Locale.US, "P%d %.1f C", i + 1, tempFromCounts(c))
+                else String.format(Locale.US, "P%d %d", i + 1, c.toInt()))
+                pts.add(floatArrayOf(p[0], p[1]))
+            }
+            stats = statsLineLocked()
+        }
+        for ((i, p) in pts.withIndex()) {
+            m.mapPoints(p)
+            val x = p[0]; val y = p[1]
+            paintLine.color = Color.BLACK; paintLine.strokeWidth = ts * 0.22f
+            canvas.drawLine(x - arm, y, x + arm, y, paintLine)
+            canvas.drawLine(x, y - arm, x, y + arm, paintLine)
+            paintLine.color = Color.WHITE; paintLine.strokeWidth = ts * 0.1f
+            canvas.drawLine(x - arm, y, x + arm, y, paintLine)
+            canvas.drawLine(x, y - arm, x, y + arm, paintLine)
+            if (i == selIdx && !forSave) {
+                paintLine.color = Color.YELLOW; paintLine.strokeWidth = ts * 0.1f
+                canvas.drawCircle(x, y, arm * 1.2f, paintLine)
+            }
+            val tw = paintText.measureText(labels[i])
+            var lx = x + arm * 0.6f
+            var ly = y - arm * 0.6f
+            if (lx + tw + 8f > w) lx = x - arm * 0.6f - tw - 8f
+            if (ly - ts < 0f) ly = y + arm + ts
+            canvas.drawRect(lx - 4f, ly - ts, lx + tw + 4f, ly + ts * 0.3f, paintBg)
+            paintText.color = Color.WHITE
+            canvas.drawText(labels[i], lx, ly, paintText)
+        }
+        if (forSave && strip > 0) {
+            paintText.color = Color.WHITE
+            paintText.textSize = strip * 0.32f
+            val tsTxt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date())
+            canvas.drawText(stats, 12f, (h - strip) + strip * 0.42f, paintText)
+            canvas.drawText(tsTxt, 12f, (h - strip) + strip * 0.85f, paintText)
+        }
+    }
+
+    fun handleTouch(v: View, e: MotionEvent): Boolean {
+        val m = fitMatrix(v.width, v.height)
+        val inv = Matrix()
+        if (!m.invert(inv)) return true
+        val pt = floatArrayOf(e.x, e.y)
+        inv.mapPoints(pt)
+        val ix = pt[0].coerceIn(0f, W - 1f)
+        val iy = pt[1].coerceIn(0f, H - 1f)
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> synchronized(lock) {
+                var best = -1
+                var bd = Float.MAX_VALUE
+                for ((i, p) in points.withIndex()) {
+                    val sp = floatArrayOf(p[0], p[1])
+                    m.mapPoints(sp)
+                    val d = hypot(sp[0] - e.x, sp[1] - e.y)
+                    if (d < bd) { bd = d; best = i }
+                }
+                if (best >= 0 && bd < 60f * density) {
+                    selected = best
+                } else if (points.size < MAXP) {
+                    points.add(floatArrayOf(ix, iy))
+                    selected = points.size - 1
+                }
+                Unit
+            }
+            MotionEvent.ACTION_MOVE -> synchronized(lock) {
+                if (selected >= 0 && selected < points.size) {
+                    points[selected][0] = ix
+                    points[selected][1] = iy
+                }
+                Unit
+            }
+        }
+        v.invalidate()
+        updateStatus()
+        return true
+    }
+
+    private fun updateStatus() {
+        val s = synchronized(lock) {
+            val sb = StringBuilder()
+            sb.append("NUC: ").append(if (hasNuc) "ada" else "belum")
+            sb.append(" | Kalib: ")
+            if (calValid) sb.append(String.format(Locale.US, "ok (%d sampel, %.4f C/unit)", samples.size, calA))
+            else sb.append("belum (").append(samples.size).append(" sampel, perlu 2)")
+            sb.append('\n').append(statsLineLocked())
+            if (selected >= 0 && selected < points.size) sb.append("  | Dipilih: P").append(selected + 1)
+            sb.toString()
+        }
+        mainHandler.post { statusText.text = s }
+    }
+
+    // ------------------------------------------------------------------ simpan PNG
+
+    private fun savePng() {
         try {
-            val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val even = rot % 2 == 0
+            val ow = if (even) 960 else 540
+            val oh = 720
+            val strip = 72
+            val out = Bitmap.createBitmap(ow, oh + strip, Bitmap.Config.ARGB_8888)
+            render(Canvas(out), ow, oh + strip, true, strip)
+            val name = "thermal_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".png"
             val cv = ContentValues().apply {
-                put(MediaStore.Downloads.DISPLAY_NAME, "thermal_test_$ts.zip")
-                put(MediaStore.Downloads.MIME_TYPE, "application/zip")
-                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ThermalTest")
+                put(MediaStore.Images.Media.DISPLAY_NAME, name)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/ThermalElena")
             }
-            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
-            if (uri == null) { log("Gagal cipta fail ZIP"); return }
-            contentResolver.openOutputStream(uri)!!.use { os ->
-                ZipOutputStream(os).use { z ->
-                    z.putNextEntry(ZipEntry("info.txt"))
-                    z.write(buildInfo().toByteArray())
-                    z.closeEntry()
-                    z.putNextEntry(ZipEntry("log.txt"))
-                    z.write(synchronized(logBuf) { logBuf.toString() }.toByteArray())
-                    z.closeEntry()
-                    for ((name, bytes) in savedFrames) {
-                        z.putNextEntry(ZipEntry(name))
-                        z.write(bytes)
-                        z.closeEntry()
-                    }
-                }
-            }
-            log("ZIP disimpan: Download/ThermalTest/thermal_test_$ts.zip (${savedFrames.size} fail frame)")
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+            if (uri == null) { toast("Gagal cipta fail."); return }
+            contentResolver.openOutputStream(uri)!!.use { os -> out.compress(Bitmap.CompressFormat.PNG, 100, os) }
+            toast("Disimpan: Pictures/ThermalElena/$name")
         } catch (e: Exception) {
-            log("writeZip gagal: $e")
-        }
-    }
-
-    // ------------------------------------------------------------------ info
-
-    private fun v(x: Any?): String = when (x) {
-        null -> "null"
-        is IntArray -> x.contentToString()
-        is LongArray -> x.contentToString()
-        is FloatArray -> x.contentToString()
-        is DoubleArray -> x.contentToString()
-        is ByteArray -> x.contentToString()
-        is BooleanArray -> x.contentToString()
-        is Array<*> -> x.contentDeepToString()
-        else -> x.toString()
-    }
-
-    private fun buildInfo(): String {
-        val sb = StringBuilder()
-        sb.append("Model: ${Build.MANUFACTURER} ${Build.MODEL}\n")
-        sb.append("Android: ${Build.VERSION.RELEASE} (SDK ${Build.VERSION.SDK_INT})\n")
-        sb.append("Fingerprint: ${Build.FINGERPRINT}\n\n")
-        val mgr = getSystemService(CAMERA_SERVICE) as CameraManager
-        try {
-            sb.append("cameraIdList: ${mgr.cameraIdList.joinToString()}\n")
-            for (id in mgr.cameraIdList) {
-                val ch = mgr.getCameraCharacteristics(id)
-                sb.append("\n===== CAMERA $id =====\n")
-                sb.append("facing=${ch.get(CameraCharacteristics.LENS_FACING)} ")
-                sb.append("level=${ch.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)}\n")
-                sb.append("pixelArray=${ch.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)} ")
-                sb.append("activeArray=${ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)} ")
-                sb.append("physSize=${ch.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)}\n")
-                sb.append("focalLengths=${v(ch.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS))} ")
-                sb.append("physicalIds=${ch.physicalCameraIds}\n")
-                sb.append("capabilities=${v(ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES))}\n")
-                val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                if (map != null) {
-                    for (f in map.outputFormats) {
-                        val sizes = map.getOutputSizes(f)?.joinToString { "${it.width}x${it.height}" } ?: "-"
-                        sb.append("  format ${formatName(f)} ($f): ${if (sizes.length > 300) sizes.take(300) + "..." else sizes}\n")
-                    }
-                }
-                sb.append("characteristicKeys:\n")
-                for (k in ch.keys) sb.append("  ${k.name} = ${v(ch.get(k)).take(200)}\n")
-                sb.append("availableRequestKeys:\n")
-                for (k in ch.availableCaptureRequestKeys) sb.append("  ${k.name}\n")
-                sb.append("availableResultKeys:\n")
-                for (k in ch.availableCaptureResultKeys) sb.append("  ${k.name}\n")
-            }
-        } catch (e: Exception) {
-            sb.append("\nralat info: $e\n")
-        }
-        val res = lastResult
-        if (res != null) {
-            sb.append("\n===== LAST CAPTURE RESULT =====\n")
-            for (k: CaptureResult.Key<*> in res.keys) {
-                sb.append("  ${k.name} = ${v(res.get(k)).take(300)}\n")
-            }
-        }
-        sb.append(probeDevices())
-        return sb.toString()
-    }
-
-
-    private fun sh(cmd: String): String = try {
-        val pr = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
-        val out = pr.inputStream.bufferedReader().readText() + pr.errorStream.bufferedReader().readText()
-        pr.waitFor(); out.take(4000)
-    } catch (e: Exception) { "ralat: $e" }
-
-    private fun probeDevices(): String {
-        val sb = StringBuilder("\n===== PROBE PERANTI / SISTEM =====\n")
-        sb.append(sh("id; ls -lZ /dev/i2c* /dev/video* /dev/shutter /dev/v4l-subdev* 2>&1 | head -40"))
-        sb.append("\n-- getprop (eco/cam/infi/thermal) --\n")
-        sb.append(sh("getprop | grep -i -E 'eco|infi|thermal|cam' | head -40"))
-        val paths = listOf("/dev/i2c-2", "/dev/i2c-6", "/dev/i2c-8", "/dev/i2c-9", "/dev/video0", "/dev/shutter")
-        sb.append("\n-- akses fail --\n")
-        for (p in paths) {
-            val f = java.io.File(p)
-            sb.append("$p exists=${f.exists()} canRead=${f.canRead()} canWrite=${f.canWrite()}\n")
-        }
-        val eeproms = listOf(
-            "/sys/devices/platform/soc/11db3000.i2c/i2c-8/8-0050/eeprom",
-            "/sys/devices/platform/11009000.i2c/i2c-2/2-0050/eeprom",
-            "/sys/devices/platform/soc/11eb0000.i2c/i2c-2/2-0050/eeprom",
-            "/sys/devices/platform/soc/11ed1000.i2c/i2c-2/2-0050/eeprom",
-            "/sys/devices/platform/11d03000.i2c9/i2c-9/9-0050/eeprom")
-        sb.append("\n-- eeprom --\n")
-        for (p in eeproms) {
-            val f = java.io.File(p)
-            sb.append("$p exists=${f.exists()} canRead=${f.canRead()}")
-            try {
-                java.io.FileInputStream(f).use { ins ->
-                    val b = ByteArray(64); val n = ins.read(b)
-                    sb.append(" first$n=" + b.take(maxOf(n, 0)).joinToString("") { "%02x".format(it) })
-                }
-            } catch (e: Exception) { sb.append(" baca-gagal=${e.javaClass.simpleName}") }
-            sb.append("\n")
-        }
-        return sb.toString()
-    }
-
-    companion object {
-        fun formatName(f: Int): String = when (f) {
-            35 -> "YUV_420_888"
-            32 -> "RAW_SENSOR"
-            37 -> "RAW10"
-            38 -> "RAW12"
-            256 -> "JPEG"
-            17 -> "NV21"
-            20 -> "YUY2"
-            540422489 -> "Y16"
-            0x20203859 -> "Y8"
-            842094169 -> "YV12"
-            else -> "FMT_$f"
+            toast("Simpan gagal: $e")
         }
     }
 }

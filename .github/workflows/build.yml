@@ -21,7 +21,9 @@ jobs:
         with:
           gradle-version: 8.9
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
+        run: |
+          set -o pipefail
+          gradle assembleDebug --no-daemon 2>&1 | tee build.log
       - uses: actions/upload-artifact@v4
         with:
           name: ThermalTest-apk
@@ -32,3 +34,11 @@ jobs:
           tag_name: test-${{ github.run_number }}
           name: ThermalTest build ${{ github.run_number }}
           files: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish build log on failure
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: buildlog-${{ github.run_number }}
+          name: Build log ${{ github.run_number }}
+          prerelease: true
+          files: build.log
