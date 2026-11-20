@@ -442,6 +442,45 @@ class MainActivity : Activity() {
         return sb.toString()
     }
 
+
+    private fun sh(cmd: String): String = try {
+        val pr = Runtime.getRuntime().exec(arrayOf("sh", "-c", cmd))
+        val out = pr.inputStream.bufferedReader().readText() + pr.errorStream.bufferedReader().readText()
+        pr.waitFor(); out.take(4000)
+    } catch (e: Exception) { "ralat: $e" }
+
+    private fun probeDevices(): String {
+        val sb = StringBuilder("\n===== PROBE PERANTI / SISTEM =====\n")
+        sb.append(sh("id; ls -lZ /dev/i2c* /dev/video* /dev/shutter /dev/v4l-subdev* 2>&1 | head -40"))
+        sb.append("\n-- getprop (eco/cam/infi/thermal) --\n")
+        sb.append(sh("getprop | grep -i -E 'eco|infi|thermal|cam' | head -40"))
+        val paths = listOf("/dev/i2c-2", "/dev/i2c-6", "/dev/i2c-8", "/dev/i2c-9", "/dev/video0", "/dev/shutter")
+        sb.append("\n-- akses fail --\n")
+        for (p in paths) {
+            val f = java.io.File(p)
+            sb.append("$p exists=${f.exists()} canRead=${f.canRead()} canWrite=${f.canWrite()}\n")
+        }
+        val eeproms = listOf(
+            "/sys/devices/platform/soc/11db3000.i2c/i2c-8/8-0050/eeprom",
+            "/sys/devices/platform/11009000.i2c/i2c-2/2-0050/eeprom",
+            "/sys/devices/platform/soc/11eb0000.i2c/i2c-2/2-0050/eeprom",
+            "/sys/devices/platform/soc/11ed1000.i2c/i2c-2/2-0050/eeprom",
+            "/sys/devices/platform/11d03000.i2c9/i2c-9/9-0050/eeprom")
+        sb.append("\n-- eeprom --\n")
+        for (p in eeproms) {
+            val f = java.io.File(p)
+            sb.append("$p exists=${f.exists()} canRead=${f.canRead()}")
+            try {
+                java.io.FileInputStream(f).use { ins ->
+                    val b = ByteArray(64); val n = ins.read(b)
+                    sb.append(" first$n=" + b.take(maxOf(n, 0)).joinToString("") { "%02x".format(it) })
+                }
+            } catch (e: Exception) { sb.append(" baca-gagal=${e.javaClass.simpleName}") }
+            sb.append("\n")
+        }
+        return sb.toString()
+    }
+
     companion object {
         fun formatName(f: Int): String = when (f) {
             35 -> "YUV_420_888"
