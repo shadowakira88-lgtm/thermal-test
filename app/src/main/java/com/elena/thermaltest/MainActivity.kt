@@ -11,6 +11,7 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
@@ -27,6 +28,7 @@ import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import java.io.File
@@ -51,40 +53,57 @@ class ThermalView(a: MainActivity) : View(a) {
 }
 
 /**
- * Thermal Elena v1: baca data mentah 16-bit dari kamera ID 2 (YUY2 160x120),
- * betulkan corak tetap (NUC satu titik), kalibrasi linear sendiri ke deg C,
- * letak titik suhu dan bakar nilainya ke dalam PNG.
+ * Thermal Elena v2: data mentah 16-bit kamera ID 2 (YUY2 160x120), NUC + piksel rosak + buang jalur,
+ * gabungan tepi kamera biasa (emboss) dengan penjajaran manual, kalibrasi linear ke deg C,
+ * titik suhu dibakar ke PNG.
  */
 class MainActivity : Activity() {
 
     companion object {
         const val W = 160
         const val H = 120
+        const val DW = 320 // ruang paparan (sama dengan sudut pandang kamera biasa, 4:3)
+        const val DH = 240
         const val MAXP = 6
         const val FLAT_N = 40
     }
 
     private val lock = Any()
 
-    // data
+    // data thermal
     private val offset = FloatArray(W * H)
+    private val bad = BooleanArray(W * H)
     private val smooth = FloatArray(W * H)
     private val tmp = FloatArray(W * H)
     private val fixed = FloatArray(W * H)
     private val sortBuf = FloatArray(W * H)
-    private val pix = IntArray(W * H)
     private val rawBuf = IntArray(W * H)
     private val flatAcc = FloatArray(W * H)
+    private val colSm = FloatArray(W)
     private var smoothInit = false
     private var hasNuc = false
     private var flatLeft = 0
     private var rangeInit = false
     private var rLo = 0f
     private var rHi = 1f
+
+    // kamera biasa (untuk tepi)
+    private val visY = IntArray(DW * DH)
+    @Volatile private var visReady = false
+
+    // paparan gabungan
+    private val dispPix = IntArray(DW * DH)
     private var bmp: Bitmap? = null
 
+    // penjajaran
+    private var zoom = 1.0f
+    private var ox = 0f
+    private var oy = 0f
+    private var detail = 1.0f
+    private var fusionOn = true
+
     // titik + kalibrasi
-    private val points = ArrayList<FloatArray>()
+    private val points = ArrayList<FloatArray>() // dalam ruang paparan (DW x DH)
     private var selected = -1
     private val samples = ArrayList<FloatArray>() // [counts, suhu]
     private var calA = 0f
@@ -92,12 +111,18 @@ class MainActivity : Activity() {
     private var calValid = false
     @Volatile private var rot = 0
 
-    // paparan
+    // UI
     private lateinit var thermalView: ThermalView
     private lateinit var statusText: TextView
+    private lateinit var fusionBtn: Button
+    private lateinit var alignPanel: LinearLayout
     private val mainHandler = Handler(Looper.getMainLooper())
     private var density = 1f
     private var lastStatus = 0L
+    @Volatile private var camState = "belum mula"
+    @Volatile private var visState = "-"
+    @Volatile private var frameCount = 0
+    @Volatile private var lastErr = ""
 
     // kamera
     private var thread: HandlerThread? = null
@@ -105,12 +130,11 @@ class MainActivity : Activity() {
     private var camera: CameraDevice? = null
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
+    private var visCamera: CameraDevice? = null
+    private var visSession: CameraCaptureSession? = null
+    private var visReader: ImageReader? = null
 
     private val lut = IntArray(256)
-    @Volatile private var camState = "belum mula"
-    @Volatile private var frameCount = 0
-    @Volatile private var lastErr = ""
-
     private val paintLine = Paint(Paint.ANTI_ALIAS_FLAG)
     private val paintText = Paint(Paint.ANTI_ALIAS_FLAG)
     private val paintBg = Paint()
@@ -150,12 +174,37 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
         }
-        statusText = TextView(this).apply { textSize = 12f; text = "Memulakan..." }
+        statusText = TextView(this).apply { textSize = 11f; text = "Memulakan..." }
         root.addView(statusText)
 
         thermalView = ThermalView(this)
         root.addView(thermalView, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        // panel penjajaran
+        alignPanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; visibility = View.GONE }
+        fun seek(label: String, maxVal: Int, init: Int, onChange: (Int) -> Unit) {
+            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            r.addView(TextView(this).apply { text = label; textSize = 12f },
+                LinearLayout.LayoutParams((72 * density).toInt(), LinearLayout.LayoutParams.WRAP_CONTENT))
+            val sb = SeekBar(this)
+            sb.max = maxVal
+            sb.progress = init
+            sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    if (fromUser) onChange(p)
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) { saveState() }
+            })
+            r.addView(sb, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            alignPanel.addView(r)
+        }
+        seek("Zum", 150, ((zoom - 0.5f) * 100f).toInt().coerceIn(0, 150)) { synchronized(lock) { zoom = 0.5f + it / 100f } }
+        seek("Geser X", 100, (ox + 50f).toInt().coerceIn(0, 100)) { synchronized(lock) { ox = it - 50f } }
+        seek("Geser Y", 100, (oy + 50f).toInt().coerceIn(0, 100)) { synchronized(lock) { oy = it - 50f } }
+        seek("Butiran", 300, (detail * 100f).toInt().coerceIn(0, 300)) { synchronized(lock) { detail = it / 100f } }
+        root.addView(alignPanel)
 
         fun row(vararg items: Pair<String, () -> Unit>): LinearLayout {
             val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -166,6 +215,7 @@ class MainActivity : Activity() {
                     isAllCaps = false
                     setOnClickListener { action() }
                 }
+                if (label.startsWith("Gabung")) fusionBtn = b
                 r.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             }
             return r
@@ -179,6 +229,16 @@ class MainActivity : Activity() {
             "Simpan PNG" to { savePng() },
             "Reset titik" to { resetPoints() },
             "Reset kalib" to { resetCalibration() }
+        ))
+        root.addView(row(
+            "Gabung: ${if (fusionOn) "ON" else "OFF"}" to {
+                synchronized(lock) { fusionOn = !fusionOn }
+                fusionBtn.text = "Gabung: ${if (fusionOn) "ON" else "OFF"}"
+                saveState()
+            },
+            "Laras" to {
+                alignPanel.visibility = if (alignPanel.visibility == View.GONE) View.VISIBLE else View.GONE
+            }
         ))
         setContentView(root)
     }
@@ -206,7 +266,7 @@ class MainActivity : Activity() {
             .setMessage("Tutup lensa thermal dengan permukaan rata dan seragam (kad atau kertas tebal, rapat), " +
                 "kemudian tekan Mula. App rakam $FLAT_N frame. Jangan gerakkan.")
             .setPositiveButton("Mula") { _, _ ->
-                synchronized(lock) { java.util.Arrays.fill(flatAcc, 0f); flatLeft = FLAT_N }
+                synchronized(lock) { Arrays.fill(flatAcc, 0f); flatLeft = FLAT_N }
                 toast("Merakam rujukan...")
             }
             .setNegativeButton("Batal", null)
@@ -214,8 +274,8 @@ class MainActivity : Activity() {
     }
 
     private fun askCalibrate() {
-        val sel = synchronized(lock) { selected }
-        if (sel < 0 || sel >= synchronized(lock) { points.size }) {
+        val sel = synchronized(lock) { if (selected < points.size) selected else -1 }
+        if (sel < 0) {
             toast("Ketik imej untuk letak titik, pilih satu titik, kemudian tekan Kalibrasi.")
             return
         }
@@ -234,7 +294,7 @@ class MainActivity : Activity() {
                 if (t == null) { toast("Nombor tak sah."); return@setPositiveButton }
                 synchronized(lock) {
                     if (sel < points.size) {
-                        val c = countsAtLocked(points[sel][0], points[sel][1])
+                        val c = countsAtDispLocked(points[sel][0], points[sel][1])
                         samples.add(floatArrayOf(c, t))
                         refitLocked()
                     }
@@ -247,7 +307,12 @@ class MainActivity : Activity() {
             .show()
     }
 
-    // ------------------------------------------------------------------ kalibrasi
+    // ------------------------------------------------------------------ pemetaan + kalibrasi
+
+    private fun thermalXY(u: Float, v: Float): FloatArray = floatArrayOf(
+        ((u - DW / 2f) / (DW / 2f)) * 80f / zoom + 80f + ox,
+        ((v - DH / 2f) / (DH / 2f)) * 60f / zoom + 60f + oy
+    )
 
     private fun countsAtLocked(x: Float, y: Float): Float {
         val cx = x.toInt().coerceIn(1, W - 2)
@@ -255,6 +320,11 @@ class MainActivity : Activity() {
         var s = 0f
         for (dy in -1..1) for (dx in -1..1) s += smooth[(cy + dy) * W + (cx + dx)]
         return s / 9f
+    }
+
+    private fun countsAtDispLocked(u: Float, v: Float): Float {
+        val t = thermalXY(u, v)
+        return countsAtLocked(t[0], t[1])
     }
 
     private fun refitLocked() {
@@ -266,7 +336,7 @@ class MainActivity : Activity() {
         val mx = sx / n; val my = sy / n
         var sxx = 0.0; var sxy = 0.0
         for (s in samples) { sxx += (s[0] - mx) * (s[0] - mx); sxy += (s[0] - mx) * (s[1] - my) }
-        if (sxx < 400.0) return // counts terlalu dekat antara sampel
+        if (sxx < 400.0) return
         val a = sxy / sxx
         calA = a.toFloat()
         calB = (my - a * mx).toFloat()
@@ -280,6 +350,11 @@ class MainActivity : Activity() {
     private fun loadState() {
         val sp = getSharedPreferences("thermal", MODE_PRIVATE)
         rot = sp.getInt("rot", 0)
+        zoom = sp.getFloat("zoom", 1.0f)
+        ox = sp.getFloat("ox", 0f)
+        oy = sp.getFloat("oy", 0f)
+        detail = sp.getFloat("detail", 1.0f)
+        fusionOn = sp.getBoolean("fusion", true)
         val s = sp.getString("samples", "") ?: ""
         for (part in s.split(";")) {
             val ab = part.split("|")
@@ -295,13 +370,28 @@ class MainActivity : Activity() {
             for (i in offset.indices) offset[i] = bb.getFloat()
             hasNuc = true
         }
+        val fb = File(filesDir, "bad.bin")
+        if (fb.exists() && fb.length() == (W * H).toLong()) {
+            val b = fb.readBytes()
+            for (i in bad.indices) bad[i] = b[i].toInt() != 0
+        }
     }
 
     private fun saveState() {
         val sb = StringBuilder()
-        synchronized(lock) { for (s in samples) sb.append(s[0]).append('|').append(s[1]).append(';') }
+        var z = 1f
+        var x = 0f
+        var y = 0f
+        var d = 1f
+        var fu = true
+        synchronized(lock) {
+            for (s in samples) sb.append(s[0]).append('|').append(s[1]).append(';')
+            z = zoom; x = ox; y = oy; d = detail; fu = fusionOn
+        }
         getSharedPreferences("thermal", MODE_PRIVATE).edit()
-            .putInt("rot", rot).putString("samples", sb.toString()).apply()
+            .putInt("rot", rot).putString("samples", sb.toString())
+            .putFloat("zoom", z).putFloat("ox", x).putFloat("oy", y)
+            .putFloat("detail", d).putBoolean("fusion", fu).apply()
     }
 
     private fun saveNuc() {
@@ -309,6 +399,9 @@ class MainActivity : Activity() {
             val bb = ByteBuffer.allocate(W * H * 4).order(ByteOrder.LITTLE_ENDIAN)
             for (v in offset) bb.putFloat(v)
             File(filesDir, "nuc.bin").writeBytes(bb.array())
+            val b = ByteArray(W * H)
+            for (i in bad.indices) b[i] = if (bad[i]) 1 else 0
+            File(filesDir, "bad.bin").writeBytes(b)
         } catch (_: Exception) {}
     }
 
@@ -317,6 +410,7 @@ class MainActivity : Activity() {
     private fun startCamera() {
         if (thread != null) return
         camState = "membuka kamera 2..."
+        visState = "-"
         updateStatus()
         thread = HandlerThread("cam").also { it.start() }
         handler = Handler(thread!!.looper)
@@ -326,11 +420,14 @@ class MainActivity : Activity() {
         val mgr = getSystemService(CAMERA_SERVICE) as CameraManager
         try {
             mgr.openCamera("2", object : CameraDevice.StateCallback() {
-                override fun onOpened(cd: CameraDevice) { camera = cd; camState = "kamera dibuka"; updateStatus(); createSession(cd, rd) }
-                override fun onDisconnected(cd: CameraDevice) { cd.close(); camera = null; camState = "kamera terputus"; updateStatus() }
+                override fun onOpened(cd: CameraDevice) {
+                    camera = cd; camState = "kamera dibuka"; updateStatus(); createSession(cd, rd)
+                }
+                override fun onDisconnected(cd: CameraDevice) {
+                    cd.close(); camera = null; camState = "kamera terputus"; updateStatus()
+                }
                 override fun onError(cd: CameraDevice, error: Int) {
-                    cd.close(); camera = null
-                    camState = "RALAT kamera kod $error"; updateStatus()
+                    cd.close(); camera = null; camState = "RALAT kamera kod $error"; updateStatus()
                 }
             }, handler)
         } catch (e: Exception) {
@@ -349,20 +446,113 @@ class MainActivity : Activity() {
                         req.addTarget(rd.surface)
                         s.setRepeatingRequest(req.build(), null, handler)
                         camState = "streaming, tunggu frame"; updateStatus()
+                        openVisible()
                     } catch (e: Exception) { camState = "GAGAL streaming: $e"; updateStatus() }
                 }
-                override fun onConfigureFailed(s: CameraCaptureSession) { camState = "konfigurasi sesi GAGAL"; updateStatus() }
+                override fun onConfigureFailed(s: CameraCaptureSession) {
+                    camState = "konfigurasi sesi GAGAL"; updateStatus()
+                }
             }, handler)
         } catch (e: Exception) { camState = "GAGAL cipta sesi: $e"; updateStatus() }
+    }
+
+    /** Kamera biasa (ID 0) untuk tepi/emboss. Jika gagal, thermal tetap jalan tanpa gabungan. */
+    @Suppress("DEPRECATION")
+    private fun openVisible() {
+        try {
+            val mgr = getSystemService(CAMERA_SERVICE) as CameraManager
+            val ch = mgr.getCameraCharacteristics("0")
+            val map = ch.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val sizes = map?.getOutputSizes(35)
+            var w = 640
+            var h = 480
+            if (sizes != null && sizes.isNotEmpty()) {
+                val cands = sizes.filter { it.width * 3 == it.height * 4 && it.width in 640..1280 }
+                val pick = cands.minByOrNull { it.width }
+                    ?: sizes.minByOrNull { abs(it.width - 640) + abs(it.height - 480) }!!
+                w = pick.width
+                h = pick.height
+            }
+            val rd = ImageReader.newInstance(w, h, 35, 3)
+            visReader = rd
+            rd.setOnImageAvailableListener({ r -> onVisImage(r) }, handler)
+            visState = "membuka kamera 0 (${w}x$h)"
+            mgr.openCamera("0", object : CameraDevice.StateCallback() {
+                override fun onOpened(cd: CameraDevice) {
+                    visCamera = cd
+                    try {
+                        cd.createCaptureSession(listOf(rd.surface), object : CameraCaptureSession.StateCallback() {
+                            override fun onConfigured(s: CameraCaptureSession) {
+                                visSession = s
+                                try {
+                                    val req = cd.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                                    req.addTarget(rd.surface)
+                                    s.setRepeatingRequest(req.build(), null, handler)
+                                    visState = "kamera 0 jalan"
+                                } catch (e: Exception) { visState = "kamera 0 GAGAL: $e" }
+                                updateStatus()
+                            }
+                            override fun onConfigureFailed(s: CameraCaptureSession) {
+                                visState = "kamera 0 konfigurasi GAGAL"; updateStatus()
+                            }
+                        }, handler)
+                    } catch (e: Exception) { visState = "kamera 0 GAGAL: $e"; updateStatus() }
+                }
+                override fun onDisconnected(cd: CameraDevice) {
+                    cd.close(); visCamera = null; visState = "kamera 0 terputus"; updateStatus()
+                }
+                override fun onError(cd: CameraDevice, error: Int) {
+                    cd.close(); visCamera = null; visState = "kamera 0 RALAT $error (tanpa gabungan)"; updateStatus()
+                }
+            }, handler)
+        } catch (e: Exception) {
+            visState = "kamera 0 GAGAL: $e"; updateStatus()
+        }
     }
 
     private fun stopCamera() {
         try { session?.close() } catch (_: Exception) {}
         try { camera?.close() } catch (_: Exception) {}
         try { reader?.close() } catch (_: Exception) {}
+        try { visSession?.close() } catch (_: Exception) {}
+        try { visCamera?.close() } catch (_: Exception) {}
+        try { visReader?.close() } catch (_: Exception) {}
         session = null; camera = null; reader = null
+        visSession = null; visCamera = null; visReader = null
+        visReady = false
         thread?.quitSafely(); thread = null; handler = null
         camState = "dihentikan"
+    }
+
+    private fun onVisImage(r: ImageReader) {
+        val img = try { r.acquireLatestImage() } catch (e: Exception) { null } ?: return
+        try {
+            val p = img.planes[0]
+            val buf = p.buffer.duplicate()
+            val rs = p.rowStride
+            val ps = p.pixelStride
+            val iw = img.width
+            val ih = img.height
+            synchronized(lock) {
+                for (v in 0 until DH) {
+                    val y0 = min(v * ih / DH, ih - 2)
+                    for (u in 0 until DW) {
+                        val x0 = min(u * iw / DW, iw - 2)
+                        var s = 0
+                        for (dy in 0..1) for (dx in 0..1) {
+                            val pos = (y0 + dy) * rs + (x0 + dx) * ps
+                            if (pos < buf.limit()) s += buf.get(pos).toInt() and 0xFF
+                        }
+                        visY[v * DW + u] = s / 4
+                    }
+                }
+                visReady = true
+            }
+        } catch (e: Exception) {
+            lastErr = "vis: $e"
+        } finally {
+            img.close()
+        }
     }
 
     private fun onImage(r: ImageReader) {
@@ -405,28 +595,72 @@ class MainActivity : Activity() {
             while (k < stops.size - 2 && t > stops[k + 1][0]) k++
             val a = stops[k]; val b = stops[k + 1]
             val f = ((t - a[0]) / (b[0] - a[0])).coerceIn(0f, 1f)
-            val r = (a[1] + (b[1] - a[1]) * f).toInt()
-            val g = (a[2] + (b[2] - a[2]) * f).toInt()
-            val bl = (a[3] + (b[3] - a[3]) * f).toInt()
-            lut[i] = Color.rgb(r, g, bl)
+            lut[i] = Color.rgb(
+                (a[1] + (b[1] - a[1]) * f).toInt(),
+                (a[2] + (b[2] - a[2]) * f).toInt(),
+                (a[3] + (b[3] - a[3]) * f).toInt()
+            )
         }
     }
 
+    private fun mean8(a: FloatArray, i: Int): Float =
+        (a[i - 1] + a[i + 1] + a[i - W] + a[i + W] + a[i - W - 1] + a[i - W + 1] + a[i + W - 1] + a[i + W + 1]) / 8f
+
     private fun finishFlatLocked() {
+        val f = FloatArray(W * H)
         var sum = 0.0
-        for (v in flatAcc) sum += v
-        val mean = (sum / flatAcc.size / FLAT_N).toFloat()
-        for (i in offset.indices) offset[i] = flatAcc[i] / FLAT_N - mean
+        for (i in f.indices) { f[i] = flatAcc[i] / FLAT_N; sum += f[i] }
+        val mean = (sum / f.size).toFloat()
+        for (i in offset.indices) offset[i] = f[i] - mean
+        // cari piksel rosak/tersangkut: sisihan besar berbanding jiran
+        val res = FloatArray(W * H)
+        val absRes = ArrayList<Float>()
+        for (y in 1 until H - 1) for (x in 1 until W - 1) {
+            val i = y * W + x
+            res[i] = f[i] - mean8(f, i)
+            absRes.add(abs(res[i]))
+        }
+        absRes.sort()
+        val sigma = 1.4826f * absRes[absRes.size / 2]
+        val thr = max(4f * sigma, 400f)
+        var count = 0
+        for (i in bad.indices) bad[i] = false
+        for (y in 1 until H - 1) for (x in 1 until W - 1) {
+            val i = y * W + x
+            if (abs(res[i]) > thr) { bad[i] = true; count++ }
+        }
         hasNuc = true
         smoothInit = false
         saveNuc()
-        toast("NUC siap. Corak tetap dibetulkan.")
+        toast("NUC siap. $count piksel rosak dikesan dan ditampal.")
+    }
+
+    private fun destripe(a: FloatArray) {
+        val colHP = FloatArray(W)
+        val pre = FloatArray(W + 1)
+        for (y in 0 until H) {
+            val rowBase = y * W
+            for (x in 0 until W) pre[x + 1] = pre[x] + a[rowBase + x]
+            for (x in 0 until W) {
+                val lo = max(0, x - 4)
+                val hi = min(W - 1, x + 4)
+                val avg = (pre[hi + 1] - pre[lo]) / (hi - lo + 1)
+                colHP[x] += a[rowBase + x] - avg
+            }
+        }
+        for (x in 0 until W) {
+            val v = (colHP[x] / H).coerceIn(-120f, 120f)
+            colSm[x] += 0.1f * (v - colSm[x])
+        }
+        for (y in 0 until H) for (x in 0 until W) a[y * W + x] -= colSm[x]
     }
 
     private fun processFrame(raw: IntArray) {
         synchronized(lock) {
-            // baris pertama ialah artifak sensor: salin dari baris kedua
+            // baris pertama dan dua baris terakhir ialah artifak sensor
             System.arraycopy(raw, W, raw, 0, W)
+            System.arraycopy(raw, (H - 3) * W, raw, (H - 2) * W, W)
+            System.arraycopy(raw, (H - 3) * W, raw, (H - 1) * W, W)
             if (flatLeft > 0) {
                 for (i in raw.indices) flatAcc[i] += raw[i].toFloat()
                 flatLeft--
@@ -434,13 +668,13 @@ class MainActivity : Activity() {
             }
             for (i in raw.indices) tmp[i] = raw[i] - offset[i]
             System.arraycopy(tmp, 0, fixed, 0, tmp.size)
-            // piksel rosak: ganti dengan purata jiran jika terpencil
+            // piksel rosak: ganti dengan purata jiran (senarai tetap + pencilan besar)
             for (y in 1 until H - 1) for (x in 1 until W - 1) {
                 val i = y * W + x
-                val m = (tmp[i - 1] + tmp[i + 1] + tmp[i - W] + tmp[i + W] +
-                    tmp[i - W - 1] + tmp[i - W + 1] + tmp[i + W - 1] + tmp[i + W + 1]) / 8f
-                if (abs(tmp[i] - m) > 900f) fixed[i] = m
+                val m = mean8(tmp, i)
+                if (bad[i] || abs(tmp[i] - m) > 900f) fixed[i] = m
             }
+            destripe(fixed)
             if (!smoothInit) {
                 System.arraycopy(fixed, 0, smooth, 0, fixed.size)
                 smoothInit = true
@@ -449,18 +683,45 @@ class MainActivity : Activity() {
             }
             System.arraycopy(smooth, 0, sortBuf, 0, smooth.size)
             Arrays.sort(sortBuf)
-            var lo = sortBuf[(sortBuf.size * 0.01f).toInt()]
-            var hi = sortBuf[(sortBuf.size * 0.99f).toInt()]
+            var lo = sortBuf[(sortBuf.size * 0.005f).toInt()]
+            var hi = sortBuf[(sortBuf.size * 0.999f).toInt()]
             if (hi - lo < 80f) { val c = (hi + lo) / 2f; lo = c - 40f; hi = c + 40f }
             if (!rangeInit) { rLo = lo; rHi = hi; rangeInit = true }
             else { rLo += 0.2f * (lo - rLo); rHi += 0.2f * (hi - rHi) }
-            val span = max(1f, rHi - rLo)
-            for (i in pix.indices) {
-                val idx = (((smooth[i] - rLo) / span) * 255f).toInt().coerceIn(0, 255)
-                pix[i] = lut[idx]
-            }
-            bmp = Bitmap.createBitmap(pix, W, H, Bitmap.Config.ARGB_8888)
+            composeLocked(max(1f, rHi - rLo))
         }
+    }
+
+    /** Bina bitmap paparan DWxDH: warna thermal (diinterpolasi) + emboss dari kamera biasa. */
+    private fun composeLocked(span: Float) {
+        val fusion = fusionOn && visReady
+        val zx = 1f / zoom
+        for (v in 0 until DH) {
+            val ty = (((v + 0.5f - DH / 2f) / (DH / 2f)) * 60f * zx + 60f + oy).coerceIn(0f, H - 1.001f)
+            val y0 = ty.toInt()
+            val fy = ty - y0
+            for (u in 0 until DW) {
+                val tx = (((u + 0.5f - DW / 2f) / (DW / 2f)) * 80f * zx + 80f + ox).coerceIn(0f, W - 1.001f)
+                val x0 = tx.toInt()
+                val fx = tx - x0
+                val i = y0 * W + x0
+                val c = smooth[i] * (1 - fx) * (1 - fy) + smooth[i + 1] * fx * (1 - fy) +
+                    smooth[i + W] * (1 - fx) * fy + smooth[i + W + 1] * fx * fy
+                val idx = (((c - rLo) / span) * 255f).toInt().coerceIn(0, 255)
+                var col = lut[idx]
+                if (fusion && u >= 1 && u < DW - 1 && v >= 1 && v < DH - 1) {
+                    val d = ((visY[(v + 1) * DW + u + 1] - visY[(v - 1) * DW + u - 1]) * detail / 160f)
+                        .coerceIn(-0.8f, 0.8f)
+                    val f = 1f + d
+                    val r = (Color.red(col) * f + d * 40f).toInt().coerceIn(0, 255)
+                    val g = (Color.green(col) * f + d * 40f).toInt().coerceIn(0, 255)
+                    val b = (Color.blue(col) * f + d * 40f).toInt().coerceIn(0, 255)
+                    col = Color.rgb(r, g, b)
+                }
+                dispPix[v * DW + u] = col
+            }
+        }
+        bmp = Bitmap.createBitmap(dispPix, DW, DH, Bitmap.Config.ARGB_8888)
     }
 
     // ------------------------------------------------------------------ lukisan
@@ -468,10 +729,10 @@ class MainActivity : Activity() {
     private fun fitMatrix(w: Int, availH: Int): Matrix {
         val r = rot
         val m = Matrix()
-        m.postTranslate(-W / 2f, -H / 2f)
+        m.postTranslate(-DW / 2f, -DH / 2f)
         m.postRotate(r * 90f)
-        val rw = if (r % 2 == 0) W else H
-        val rh = if (r % 2 == 0) H else W
+        val rw = if (r % 2 == 0) DW else DH
+        val rh = if (r % 2 == 0) DH else DW
         val s = min(w.toFloat() / rw, availH.toFloat() / rh)
         m.postScale(s, s)
         m.postTranslate(w / 2f, availH / 2f)
@@ -479,14 +740,16 @@ class MainActivity : Activity() {
     }
 
     private fun statsLineLocked(): String {
-        var mn = Float.MAX_VALUE; var mxv = -Float.MAX_VALUE
+        var mn = Float.MAX_VALUE
+        var mxv = -Float.MAX_VALUE
         for (y in 1 until H - 1) for (x in 1 until W - 1) {
             val v = smooth[y * W + x]
             if (v < mn) mn = v
             if (v > mxv) mxv = v
         }
         return if (calValid) {
-            val a = tempFromCounts(mn); val b = tempFromCounts(mxv)
+            val a = tempFromCounts(mn)
+            val b = tempFromCounts(mxv)
             String.format(Locale.US, "Min %.1f  Max %.1f C", min(a, b), max(a, b))
         } else {
             "Belum dikalibrasi (nilai mentah)"
@@ -513,7 +776,7 @@ class MainActivity : Activity() {
         synchronized(lock) {
             selIdx = selected
             for ((i, p) in points.withIndex()) {
-                val c = countsAtLocked(p[0], p[1])
+                val c = countsAtDispLocked(p[0], p[1])
                 labels.add(if (calValid) String.format(Locale.US, "P%d %.1f C", i + 1, tempFromCounts(c))
                 else String.format(Locale.US, "P%d %d", i + 1, c.toInt()))
                 pts.add(floatArrayOf(p[0], p[1]))
@@ -522,7 +785,8 @@ class MainActivity : Activity() {
         }
         for ((i, p) in pts.withIndex()) {
             m.mapPoints(p)
-            val x = p[0]; val y = p[1]
+            val x = p[0]
+            val y = p[1]
             paintLine.color = Color.BLACK; paintLine.strokeWidth = ts * 0.22f
             canvas.drawLine(x - arm, y, x + arm, y, paintLine)
             canvas.drawLine(x, y - arm, x, y + arm, paintLine)
@@ -557,8 +821,8 @@ class MainActivity : Activity() {
         if (!m.invert(inv)) return true
         val pt = floatArrayOf(e.x, e.y)
         inv.mapPoints(pt)
-        val ix = pt[0].coerceIn(0f, W - 1f)
-        val iy = pt[1].coerceIn(0f, H - 1f)
+        val ix = pt[0].coerceIn(0f, DW - 1f)
+        val iy = pt[1].coerceIn(0f, DH - 1f)
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> synchronized(lock) {
                 var best = -1
@@ -600,6 +864,7 @@ class MainActivity : Activity() {
             sb.append('\n').append(statsLineLocked())
             if (selected >= 0 && selected < points.size) sb.append("  | Dipilih: P").append(selected + 1)
             sb.append('\n').append("Kamera: ").append(camState).append(" | frame: ").append(frameCount)
+            sb.append('\n').append("Biasa: ").append(visState)
             if (lastErr.isNotEmpty()) sb.append("\nRalat: ").append(lastErr)
             sb.toString()
         }
