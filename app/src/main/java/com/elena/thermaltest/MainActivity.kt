@@ -439,6 +439,7 @@ class MainActivity : Activity() {
                 sb.append("  ${k.name} = ${v(res.get(k)).take(300)}\n")
             }
         }
+        sb.append(probeDevices())
         return sb.toString()
     }
 
