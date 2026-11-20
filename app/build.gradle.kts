@@ -11,8 +11,8 @@ android {
         applicationId = "com.elena.thermaltest"
         minSdk = 29
         targetSdk = 34
-        versionCode = 7
-        versionName = "2.1"
+        versionCode = 8
+        versionName = "2.2"
     }
 
     compileOptions {

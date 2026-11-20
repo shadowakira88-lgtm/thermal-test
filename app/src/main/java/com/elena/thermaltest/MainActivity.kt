@@ -3,6 +3,8 @@ package com.elena.thermaltest
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -28,6 +30,7 @@ import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
@@ -38,8 +41,12 @@ import java.text.SimpleDateFormat
 import java.util.Arrays
 import java.util.Date
 import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.hypot
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
 
@@ -79,10 +86,14 @@ class MainActivity : Activity() {
     private val sortBuf = FloatArray(W * H)
     private val rawBuf = IntArray(W * H)
     private val flatAcc = FloatArray(W * H)
+    private val lastRaw = IntArray(W * H)
     private val colSm = FloatArray(W)
     private var smoothInit = false
     private var hasNuc = false
+    private var nucNote = ""
     private var flatLeft = 0
+    private var flatTotal = FLAT_N
+    private var flatHP = false
     private var rangeInit = false
     private var rLo = 0f
     private var rHi = 1f
@@ -115,6 +126,7 @@ class MainActivity : Activity() {
     private var calA = 0f
     private var calB = 0f
     private var calValid = false
+    private var calRms = 0f
     @Volatile private var rot = 0
 
     // UI
@@ -256,6 +268,12 @@ class MainActivity : Activity() {
                 alignPanel.visibility = if (alignPanel.visibility == View.GONE) View.VISIBLE else View.GONE
             }
         ))
+        root.addView(row(
+            "Eksport" to { exportDiag() },
+            "Setup" to { askSetup() },
+            "Reset NUC" to { resetNuc() }
+        ))
+        rangeBtn.text = if (rangeLocked) "Julat: Kunci" else "Julat: Auto"
         setContentView(root)
     }
 
@@ -270,51 +288,101 @@ class MainActivity : Activity() {
     }
 
     private fun resetCalibration() {
-        synchronized(lock) { samples.clear(); calValid = false }
+        synchronized(lock) { samples.clear(); calValid = false; calA = 0f; calB = 0f }
         saveState()
         updateStatus()
         thermalView.invalidate()
     }
 
+    private fun resetNuc() {
+        synchronized(lock) {
+            Arrays.fill(offset, 0f)
+            Arrays.fill(bad, false)
+            hasNuc = false
+            nucNote = ""
+            samples.clear()
+            calValid = false
+            smoothInit = false
+        }
+        try { File(filesDir, "nuc.bin").delete(); File(filesDir, "bad.bin").delete() } catch (_: Exception) {}
+        saveState()
+        updateStatus()
+        toast("NUC dipadam. Kalibrasi perlu diulang.")
+    }
+
     private fun askFlat() {
         AlertDialog.Builder(this)
             .setTitle("Betulkan corak tetap (NUC)")
-            .setMessage("Tutup lensa thermal dengan permukaan rata dan seragam (kad atau kertas tebal, rapat), " +
-                "kemudian tekan Mula. App rakam $FLAT_N frame. Jangan gerakkan.")
-            .setPositiveButton("Mula") { _, _ ->
-                synchronized(lock) { Arrays.fill(flatAcc, 0f); flatLeft = FLAT_N }
-                toast("Merakam rujukan...")
-            }
+            .setMessage("Cara 1 - Tutup lensa: tutup lensa thermal rapat dengan kad atau kertas tebal yang seragam, " +
+                "jangan gerak. Paling tepat.\n\n" +
+                "Cara 2 - Gerak: halakan ke pemandangan dan gerakkan telefon perlahan-lahan ke sana sini " +
+                "sehingga selesai. Hanya buang corak halus, jadi beza suhu sebenar tidak hilang.\n\n" +
+                "JANGAN guna Cara 1 kalau lensa tak ditutup, nanti semua suhu jadi rata.")
+            .setPositiveButton("Cara 1: Tutup") { _, _ -> startFlat(false) }
+            .setNeutralButton("Cara 2: Gerak") { _, _ -> startFlat(true) }
             .setNegativeButton("Batal", null)
             .show()
     }
 
+    private fun startFlat(hp: Boolean) {
+        synchronized(lock) {
+            flatHP = hp
+            flatTotal = if (hp) 90 else FLAT_N
+            Arrays.fill(flatAcc, 0f)
+            flatLeft = flatTotal
+        }
+        toast(if (hp) "Merakam... gerakkan telefon perlahan ke sana sini." else "Merakam... jangan gerak.")
+    }
+
     private fun askCalibrate() {
-        val sel = synchronized(lock) { if (selected < points.size) selected else -1 }
-        if (sel < 0) {
-            toast("Ketik imej untuk letak titik, pilih satu titik, kemudian tekan Kalibrasi.")
+        val counts = synchronized(lock) { points.map { countsAtDispLocked(it[0], it[1]) } }
+        if (counts.isEmpty()) {
+            toast("Ketik imej untuk letak titik dahulu, kemudian tekan Kalibrasi.")
             return
         }
-        val input = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or
-                InputType.TYPE_NUMBER_FLAG_SIGNED
-            hint = "cth 33.2"
+        val pad = (12 * density).toInt()
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad / 2, pad, 0) }
+        val edits = ArrayList<EditText>()
+        for ((i, c) in counts.withIndex()) {
+            val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            r.addView(TextView(this).apply { text = "P${i + 1}  (kiraan ${c.toInt()})"; textSize = 15f },
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            val et = EditText(this).apply {
+                inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL or
+                    InputType.TYPE_NUMBER_FLAG_SIGNED
+                hint = "suhu C"
+            }
+            r.addView(et, LinearLayout.LayoutParams((110 * density).toInt(), LinearLayout.LayoutParams.WRAP_CONTENT))
+            edits.add(et)
+            box.addView(r)
         }
+        val sv = ScrollView(this)
+        sv.addView(box)
         AlertDialog.Builder(this)
-            .setTitle("Suhu sebenar di P${sel + 1} (deg C)")
-            .setMessage("Guna bacaan ThermVue atau termometer pada tempat yang sama. " +
-                "Perlu sekurang-kurangnya 2 sampel pada suhu berbeza.")
-            .setView(input)
-            .setPositiveButton("Tambah") { _, _ ->
-                val t = input.text.toString().toFloatOrNull()
-                if (t == null) { toast("Nombor tak sah."); return@setPositiveButton }
+            .setTitle("Suhu sebenar setiap titik")
+            .setMessage("Isi suhu rujukan (ThermVue atau termometer) untuk titik yang ada rujukan, kosongkan yang lain. " +
+                "Pilih titik yang suhunya jauh beza (cth meja 32 dan air panas 71). " +
+                "Sampel lama diganti. Kalau sudah pernah kalibrasi, 1 titik sahaja cukup untuk betulkan anjakan.")
+            .setView(sv)
+            .setPositiveButton("Guna") { _, _ ->
+                var msg = ""
                 synchronized(lock) {
-                    if (sel < points.size) {
-                        val c = countsAtDispLocked(points[sel][0], points[sel][1])
-                        samples.add(floatArrayOf(c, t))
-                        refitLocked()
+                    val ns = ArrayList<FloatArray>()
+                    for ((i, et) in edits.withIndex()) {
+                        val t = et.text.toString().toFloatOrNull()
+                        if (t != null && i < points.size) {
+                            ns.add(floatArrayOf(countsAtDispLocked(points[i][0], points[i][1]), t))
+                        }
+                    }
+                    if (ns.isEmpty()) {
+                        msg = "Tiada suhu diisi."
+                    } else {
+                        samples.clear()
+                        samples.addAll(ns)
+                        msg = refitLocked()
                     }
                 }
+                if (msg.isNotEmpty()) toast(msg) else toast("Kalibrasi siap.")
                 saveState()
                 updateStatus()
                 thermalView.invalidate()
@@ -343,35 +411,98 @@ class MainActivity : Activity() {
         return countsAtLocked(t[0], t[1])
     }
 
-    private fun refitLocked() {
+    /** Sinaran jasad hitam (relatif, jalur ~10 um) untuk suhu dalam deg C. */
+    private fun planck(tc: Double): Double = 1.0 / (exp(1439.0 / (tc + 273.15)) - 1.0)
+
+    /** Model: kiraan = calA * planck(T) + calB. Pulangkan "" jika berjaya, atau sebab gagal. */
+    private fun refitLocked(): String {
         calValid = false
         val n = samples.size
-        if (n < 2) return
+        if (n == 0) return "Tiada sampel."
+        if (n == 1) {
+            if (calA > 0f) {
+                // model sedia ada: betulkan anjakan sahaja
+                val s = samples[0]
+                calB = (s[0] - calA * planck(s[1].toDouble())).toFloat()
+                calRms = 0f
+                calValid = true
+                return ""
+            }
+            return "Perlu sekurang-kurangnya 2 titik pada suhu berbeza (kalibrasi pertama)."
+        }
+        var cmin = Float.MAX_VALUE; var cmax = -Float.MAX_VALUE
+        var tmin = Float.MAX_VALUE; var tmax = -Float.MAX_VALUE
+        for (s in samples) {
+            cmin = min(cmin, s[0]); cmax = max(cmax, s[0])
+            tmin = min(tmin, s[1]); tmax = max(tmax, s[1])
+        }
+        if (tmax - tmin < 3f) return "Suhu rujukan terlalu hampir (perlu beza 3 C atau lebih)."
+        if (cmax - cmin < 100f) {
+            return "Kiraan thermal di titik-titik itu hampir sama (beza ${(cmax - cmin).toInt()}). " +
+                "Gambar haba rata. Ulang NUC (tutup lensa atau Cara 2) dan cuba lagi."
+        }
         var sx = 0.0; var sy = 0.0
-        for (s in samples) { sx += s[0]; sy += s[1] }
+        for (s in samples) { sx += planck(s[1].toDouble()); sy += s[0] }
         val mx = sx / n; val my = sy / n
         var sxx = 0.0; var sxy = 0.0
-        for (s in samples) { sxx += (s[0] - mx) * (s[0] - mx); sxy += (s[0] - mx) * (s[1] - my) }
-        if (sxx < 400.0) return
+        for (s in samples) {
+            val x = planck(s[1].toDouble())
+            sxx += (x - mx) * (x - mx); sxy += (x - mx) * (s[0] - my)
+        }
+        if (sxx <= 0.0) return "Data kalibrasi tak sah."
         val a = sxy / sxx
+        if (a <= 0.0) return "Kecerunan songsang (suhu tinggi, kiraan rendah). Semak suhu yang diisi."
         calA = a.toFloat()
         calB = (my - a * mx).toFloat()
         calValid = true
+        var se = 0.0
+        for (s in samples) { val d = tempFromCounts(s[0]) - s[1]; se += d * d }
+        calRms = kotlin.math.sqrt(se / n).toFloat()
+        return ""
     }
 
-    private fun tempFromCounts(c: Float): Float = calA * c + calB
+    private fun tempFromCounts(c: Float): Float {
+        val x = ((c - calB) / calA).toDouble().coerceAtLeast(1e-6)
+        val tk = 1439.0 / ln(1.0 + 1.0 / x)
+        return (tk - 273.15).coerceIn(-60.0, 500.0).toFloat()
+    }
+
+    private fun countsFromTemp(t: Float): Float = (calA * planck(t.toDouble()) + calB).toFloat()
+
+    private fun boxBlur(a: FloatArray, r: Int): FloatArray {
+        val t = FloatArray(W * H)
+        val o = FloatArray(W * H)
+        val n = (2 * r + 1).toFloat()
+        for (y in 0 until H) for (x in 0 until W) {
+            var s = 0f
+            for (k in -r..r) s += a[y * W + (x + k).coerceIn(0, W - 1)]
+            t[y * W + x] = s / n
+        }
+        for (y in 0 until H) for (x in 0 until W) {
+            var s = 0f
+            for (k in -r..r) s += t[(y + k).coerceIn(0, H - 1) * W + x]
+            o[y * W + x] = s / n
+        }
+        return o
+    }
 
     // ------------------------------------------------------------------ simpan / muat
 
     private fun loadState() {
         val sp = getSharedPreferences("thermal", MODE_PRIVATE)
+        if (sp.getInt("ver", 0) < 22) {
+            // v2.2: model kalibrasi baru dan NUC lama mungkin rosak (dirakam tanpa tutup lensa)
+            try { File(filesDir, "nuc.bin").delete(); File(filesDir, "bad.bin").delete() } catch (_: Exception) {}
+            sp.edit().putInt("ver", 22).remove("samples").apply()
+        }
         rot = sp.getInt("rot", 0)
         zoom = sp.getFloat("zoom", 1.0f)
         ox = sp.getFloat("ox", 0f)
         oy = sp.getFloat("oy", 0f)
         detail = sp.getFloat("detail", 1.0f)
         mode = sp.getInt("mode", 0).coerceIn(0, 2)
-        val s = sp.getString("samples", "") ?: ""
+        nucNote = sp.getString("nucNote", "") ?: ""
+        val s = sp.getString("samples2", "") ?: ""
         for (part in s.split(";")) {
             val ab = part.split("|")
             if (ab.size == 2) {
@@ -379,7 +510,10 @@ class MainActivity : Activity() {
                 if (c != null && t != null) samples.add(floatArrayOf(c, t))
             }
         }
-        refitLocked()
+        calA = sp.getFloat("calA", 0f)
+        calB = sp.getFloat("calB", 0f)
+        calRms = sp.getFloat("calRms", 0f)
+        calValid = sp.getBoolean("calOk", false) && calA > 0f
         val f = File(filesDir, "nuc.bin")
         if (f.exists() && f.length() == (W * H * 4).toLong()) {
             val bb = ByteBuffer.wrap(f.readBytes()).order(ByteOrder.LITTLE_ENDIAN)
@@ -400,14 +534,22 @@ class MainActivity : Activity() {
         var y = 0f
         var d = 1f
         var fu = 0
+        var ca = 0f
+        var cb = 0f
+        var cr = 0f
+        var ok = false
+        var note = ""
         synchronized(lock) {
             for (s in samples) sb.append(s[0]).append('|').append(s[1]).append(';')
             z = zoom; x = ox; y = oy; d = detail; fu = mode
+            ca = calA; cb = calB; cr = calRms; ok = calValid; note = nucNote
         }
         getSharedPreferences("thermal", MODE_PRIVATE).edit()
-            .putInt("rot", rot).putString("samples", sb.toString())
+            .putInt("rot", rot).putString("samples2", sb.toString())
             .putFloat("zoom", z).putFloat("ox", x).putFloat("oy", y)
-            .putFloat("detail", d).putInt("mode", fu).apply()
+            .putFloat("detail", d).putInt("mode", fu)
+            .putFloat("calA", ca).putFloat("calB", cb).putFloat("calRms", cr)
+            .putBoolean("calOk", ok).putString("nucNote", note).apply()
     }
 
     private fun saveNuc() {
@@ -625,9 +767,24 @@ class MainActivity : Activity() {
     private fun finishFlatLocked() {
         val f = FloatArray(W * H)
         var sum = 0.0
-        for (i in f.indices) { f[i] = flatAcc[i] / FLAT_N; sum += f[i] }
+        for (i in f.indices) { f[i] = flatAcc[i] / flatTotal; sum += f[i] }
         val mean = (sum / f.size).toFloat()
-        for (i in offset.indices) offset[i] = f[i] - mean
+        // julat kelancaran (perubahan perlahan merentas imej): tinggi bermakna ada pemandangan, bukan permukaan rata
+        val lp = boxBlur(f, 10)
+        var lpMin = Float.MAX_VALUE
+        var lpMax = -Float.MAX_VALUE
+        for (y in 12 until H - 12) for (x in 12 until W - 12) {
+            val v = lp[y * W + x]
+            if (v < lpMin) lpMin = v
+            if (v > lpMax) lpMax = v
+        }
+        val lpRange = lpMax - lpMin
+        if (flatHP) {
+            val bl = boxBlur(f, 6)
+            for (i in offset.indices) offset[i] = (f[i] - bl[i]).coerceIn(-500f, 500f)
+        } else {
+            for (i in offset.indices) offset[i] = f[i] - mean
+        }
         // cari piksel rosak/tersangkut: sisihan besar berbanding jiran
         val res = FloatArray(W * H)
         val absRes = ArrayList<Float>()
@@ -647,8 +804,17 @@ class MainActivity : Activity() {
         }
         hasNuc = true
         smoothInit = false
+        // kiraan lama tak sah selepas NUC baru; kecerunan (calA) dikekalkan supaya 1 titik cukup
+        samples.clear()
+        calValid = false
+        nucNote = if (flatHP) "halus" else "penuh"
         saveNuc()
-        toast("NUC siap. $count piksel rosak dikesan dan ditampal.")
+        saveState()
+        var warn = ""
+        if (!flatHP && lpRange > 500f) {
+            warn = " AMARAN: rujukan tak rata (julat ${lpRange.toInt()}), lensa mungkin tak tertutup. Cuba Cara 2."
+        }
+        toast("NUC siap ($nucNote). $count piksel rosak ditampal. Julat rujukan ${lpRange.toInt()}.$warn Sila kalibrasi semula.")
     }
 
     private fun destripe(a: FloatArray) {
@@ -673,6 +839,7 @@ class MainActivity : Activity() {
 
     private fun processFrame(raw: IntArray) {
         synchronized(lock) {
+            System.arraycopy(raw, 0, lastRaw, 0, raw.size)
             // baris pertama dan dua baris terakhir ialah artifak sensor
             System.arraycopy(raw, W, raw, 0, W)
             System.arraycopy(raw, (H - 3) * W, raw, (H - 2) * W, W)
@@ -913,10 +1080,16 @@ class MainActivity : Activity() {
     private fun updateStatus() {
         val s = synchronized(lock) {
             val sb = StringBuilder()
-            sb.append("NUC: ").append(if (hasNuc) "ada" else "belum")
+            sb.append("NUC: ").append(if (hasNuc) "ada ($nucNote)" else "belum")
             sb.append(" | Kalib: ")
-            if (calValid) sb.append(String.format(Locale.US, "ok (%d sampel, %.4f C/unit)", samples.size, calA))
-            else sb.append("belum (").append(samples.size).append(" sampel, perlu 2)")
+            if (calValid) {
+                val perC = (countsFromTemp(41f) - countsFromTemp(39f)) / 2f
+                sb.append(String.format(Locale.US, "ok (%d sampel, %.0f kiraan/C, ralat %.1f C)", samples.size, perC, calRms))
+            } else if (calA > 0f) {
+                sb.append("tamat (isi 1 titik rujukan untuk betulkan)")
+            } else {
+                sb.append("belum (perlu 2 titik berbeza suhu)")
+            }
             sb.append('\n').append(statsLineLocked())
             if (selected >= 0 && selected < points.size) sb.append("  | Dipilih: P").append(selected + 1)
             sb.append('\n').append("Kamera: ").append(camState).append(" | frame: ").append(frameCount)
@@ -925,6 +1098,121 @@ class MainActivity : Activity() {
             sb.toString()
         }
         mainHandler.post { statusText.text = s }
+    }
+
+    // ------------------------------------------------------------------ setup + eksport
+
+    private fun setupCodeLocked(): String = String.format(
+        Locale.US, "zoom=%.3f ox=%.1f oy=%.1f detail=%.2f mode=%d rot=%d a=%.6e b=%.6e",
+        zoom, ox, oy, detail, mode, rot, if (calValid) calA else 0f, if (calValid) calB else 0f
+    )
+
+    private fun askSetup() {
+        val pad = (12 * density).toInt()
+        val et = EditText(this).apply {
+            hint = "tampal kod setup di sini"
+            minLines = 3
+            setPadding(pad, pad, pad, pad)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Setup dari kod")
+            .setMessage("Tampal kod yang Elena beri, kemudian tekan Guna. Atau tekan Salin untuk salin setup semasa.")
+            .setView(et)
+            .setPositiveButton("Guna") { _, _ -> applySetup(et.text.toString()) }
+            .setNeutralButton("Salin semasa") { _, _ ->
+                val code = synchronized(lock) { setupCodeLocked() }
+                val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("setup", code))
+                toast("Disalin: $code")
+            }
+            .setNegativeButton("Batal", null)
+            .show()
+    }
+
+    private fun applySetup(text: String) {
+        var n = 0
+        synchronized(lock) {
+            for (tok in text.trim().split(Regex("\\s+"))) {
+                val kv = tok.split("=")
+                if (kv.size != 2) continue
+                val v = kv[1].toFloatOrNull() ?: continue
+                when (kv[0].lowercase(Locale.US)) {
+                    "zoom" -> { zoom = v.coerceIn(0.5f, 2.0f); n++ }
+                    "ox" -> { ox = v.coerceIn(-50f, 50f); n++ }
+                    "oy" -> { oy = v.coerceIn(-50f, 50f); n++ }
+                    "detail" -> { detail = v.coerceIn(0f, 3f); n++ }
+                    "mode" -> { mode = v.toInt().coerceIn(0, 2); n++ }
+                    "rot" -> { rot = v.toInt().coerceIn(0, 3); n++ }
+                    "a" -> { calA = v; n++ }
+                    "b" -> { calB = v; calValid = calA > 0f; calRms = 0f; samples.clear(); n++ }
+                }
+            }
+        }
+        saveState()
+        if (n == 0) toast("Kod tak dikenali.") else toast("$n nilai dipakai.")
+        mainHandler.post { buildUi(); updateStatus() }
+    }
+
+    /** ZIP diagnostik (Download/ThermalElena) untuk dihantar ke Elena: tetapan, titik, frame mentah, NUC, imej. */
+    private fun exportDiag() {
+        try {
+            val ts = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val txt = StringBuilder()
+            val smoothB = ByteBuffer.allocate(W * H * 4).order(ByteOrder.LITTLE_ENDIAN)
+            val rawB = ByteBuffer.allocate(W * H * 2).order(ByteOrder.LITTLE_ENDIAN)
+            val nucB = ByteBuffer.allocate(W * H * 4).order(ByteOrder.LITTLE_ENDIAN)
+            val badB = ByteArray(W * H)
+            synchronized(lock) {
+                txt.append("versi=2.2\n")
+                txt.append("setup: ").append(setupCodeLocked()).append('\n')
+                txt.append("nuc=").append(hasNuc).append(" jenis=").append(nucNote).append('\n')
+                txt.append("calValid=").append(calValid).append(" calA=").append(calA)
+                    .append(" calB=").append(calB).append(" ralat=").append(calRms).append('\n')
+                txt.append("julat paparan lo=").append(dispLo).append(" hi=").append(dispHi)
+                    .append(" kunci=").append(rangeLocked).append('\n')
+                for (s in samples) txt.append("sampel kiraan=").append(s[0]).append(" suhu=").append(s[1]).append('\n')
+                for ((i, p) in points.withIndex()) {
+                    val t = thermalXY(p[0], p[1])
+                    txt.append(String.format(Locale.US, "P%d paparan=(%.1f,%.1f) thermal=(%.1f,%.1f) kiraan=%.1f",
+                        i + 1, p[0], p[1], t[0], t[1], countsAtDispLocked(p[0], p[1])))
+                    if (calValid) txt.append(String.format(Locale.US, " suhu=%.1f", tempFromCounts(countsAtDispLocked(p[0], p[1]))))
+                    txt.append('\n')
+                }
+                txt.append("kamera: ").append(camState).append(" frame=").append(frameCount).append('\n')
+                for (v in smooth) smoothB.putFloat(v)
+                for (v in lastRaw) rawB.putShort(v.toShort())
+                for (v in offset) nucB.putFloat(v)
+                for (i in bad.indices) badB[i] = if (bad[i]) 1 else 0
+            }
+            val even = rot % 2 == 0
+            val ow = if (even) 960 else 540
+            val img = Bitmap.createBitmap(ow, 720 + 72, Bitmap.Config.ARGB_8888)
+            render(Canvas(img), ow, 720 + 72, true, 72)
+            val name = "thermal_diag_$ts.zip"
+            val cv = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, "application/zip")
+                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ThermalElena")
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+            if (uri == null) { toast("Gagal cipta fail."); return }
+            contentResolver.openOutputStream(uri)!!.use { os ->
+                ZipOutputStream(os).use { z ->
+                    fun put(n: String, b: ByteArray) { z.putNextEntry(ZipEntry(n)); z.write(b); z.closeEntry() }
+                    put("state.txt", txt.toString().toByteArray())
+                    put("smooth_f32le_160x120.bin", smoothB.array())
+                    put("raw_u16le_160x120.bin", rawB.array())
+                    put("nuc_f32le_160x120.bin", nucB.array())
+                    put("bad_u8_160x120.bin", badB)
+                    z.putNextEntry(ZipEntry("view.png"))
+                    img.compress(Bitmap.CompressFormat.PNG, 100, z)
+                    z.closeEntry()
+                }
+            }
+            toast("Disimpan: Download/ThermalElena/$name. Hantar fail ini kepada Elena.")
+        } catch (e: Exception) {
+            toast("Eksport gagal: $e")
+        }
     }
 
     // ------------------------------------------------------------------ simpan PNG
