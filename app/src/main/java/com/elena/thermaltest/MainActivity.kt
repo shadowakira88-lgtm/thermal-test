@@ -100,7 +100,13 @@ class MainActivity : Activity() {
     private var ox = 0f
     private var oy = 0f
     private var detail = 1.0f
-    private var fusionOn = true
+    private var mode = 0 // 0 emboss, 1 lapisan lut, 2 haba sahaja
+    private val modeNames = arrayOf("Emboss", "Lut", "Haba")
+    private var rangeLocked = false
+    private var lockLo = 0f
+    private var lockHi = 1f
+    private var dispLo = 0f
+    private var dispHi = 1f
 
     // titik + kalibrasi
     private val points = ArrayList<FloatArray>() // dalam ruang paparan (DW x DH)
@@ -115,6 +121,7 @@ class MainActivity : Activity() {
     private lateinit var thermalView: ThermalView
     private lateinit var statusText: TextView
     private lateinit var fusionBtn: Button
+    private lateinit var rangeBtn: Button
     private lateinit var alignPanel: LinearLayout
     private val mainHandler = Handler(Looper.getMainLooper())
     private var density = 1f
@@ -139,6 +146,7 @@ class MainActivity : Activity() {
     private val paintText = Paint(Paint.ANTI_ALIAS_FLAG)
     private val paintBg = Paint()
     private val paintBmp = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val paintBar = Paint()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -215,7 +223,8 @@ class MainActivity : Activity() {
                     isAllCaps = false
                     setOnClickListener { action() }
                 }
-                if (label.startsWith("Gabung")) fusionBtn = b
+                if (label.startsWith("Mod")) fusionBtn = b
+                if (label.startsWith("Julat")) rangeBtn = b
                 r.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             }
             return r
@@ -231,10 +240,17 @@ class MainActivity : Activity() {
             "Reset kalib" to { resetCalibration() }
         ))
         root.addView(row(
-            "Gabung: ${if (fusionOn) "ON" else "OFF"}" to {
-                synchronized(lock) { fusionOn = !fusionOn }
-                fusionBtn.text = "Gabung: ${if (fusionOn) "ON" else "OFF"}"
+            "Mod: ${modeNames[mode]}" to {
+                synchronized(lock) { mode = (mode + 1) % 3 }
+                fusionBtn.text = "Mod: ${modeNames[mode]}"
                 saveState()
+            },
+            "Julat: Auto" to {
+                synchronized(lock) {
+                    rangeLocked = !rangeLocked
+                    if (rangeLocked) { lockLo = dispLo; lockHi = dispHi }
+                }
+                rangeBtn.text = if (rangeLocked) "Julat: Kunci" else "Julat: Auto"
             },
             "Laras" to {
                 alignPanel.visibility = if (alignPanel.visibility == View.GONE) View.VISIBLE else View.GONE
@@ -354,7 +370,7 @@ class MainActivity : Activity() {
         ox = sp.getFloat("ox", 0f)
         oy = sp.getFloat("oy", 0f)
         detail = sp.getFloat("detail", 1.0f)
-        fusionOn = sp.getBoolean("fusion", true)
+        mode = sp.getInt("mode", 0).coerceIn(0, 2)
         val s = sp.getString("samples", "") ?: ""
         for (part in s.split(";")) {
             val ab = part.split("|")
@@ -383,15 +399,15 @@ class MainActivity : Activity() {
         var x = 0f
         var y = 0f
         var d = 1f
-        var fu = true
+        var fu = 0
         synchronized(lock) {
             for (s in samples) sb.append(s[0]).append('|').append(s[1]).append(';')
-            z = zoom; x = ox; y = oy; d = detail; fu = fusionOn
+            z = zoom; x = ox; y = oy; d = detail; fu = mode
         }
         getSharedPreferences("thermal", MODE_PRIVATE).edit()
             .putInt("rot", rot).putString("samples", sb.toString())
             .putFloat("zoom", z).putFloat("ox", x).putFloat("oy", y)
-            .putFloat("detail", d).putBoolean("fusion", fu).apply()
+            .putFloat("detail", d).putInt("mode", fu).apply()
     }
 
     private fun saveNuc() {
@@ -688,13 +704,17 @@ class MainActivity : Activity() {
             if (hi - lo < 80f) { val c = (hi + lo) / 2f; lo = c - 40f; hi = c + 40f }
             if (!rangeInit) { rLo = lo; rHi = hi; rangeInit = true }
             else { rLo += 0.2f * (lo - rLo); rHi += 0.2f * (hi - rHi) }
-            composeLocked(max(1f, rHi - rLo))
+            val useLo = if (rangeLocked) lockLo else rLo
+            val useHi = if (rangeLocked) lockHi else rHi
+            dispLo = useLo
+            dispHi = useHi
+            composeLocked(useLo, max(1f, useHi - useLo))
         }
     }
 
     /** Bina bitmap paparan DWxDH: warna thermal (diinterpolasi) + emboss dari kamera biasa. */
-    private fun composeLocked(span: Float) {
-        val fusion = fusionOn && visReady
+    private fun composeLocked(lo: Float, span: Float) {
+        val useVis = mode != 2 && visReady
         val zx = 1f / zoom
         for (v in 0 until DH) {
             val ty = (((v + 0.5f - DH / 2f) / (DH / 2f)) * 60f * zx + 60f + oy).coerceIn(0f, H - 1.001f)
@@ -707,9 +727,15 @@ class MainActivity : Activity() {
                 val i = y0 * W + x0
                 val c = smooth[i] * (1 - fx) * (1 - fy) + smooth[i + 1] * fx * (1 - fy) +
                     smooth[i + W] * (1 - fx) * fy + smooth[i + W + 1] * fx * fy
-                val idx = (((c - rLo) / span) * 255f).toInt().coerceIn(0, 255)
+                val idx = (((c - lo) / span) * 255f).toInt().coerceIn(0, 255)
                 var col = lut[idx]
-                if (fusion && u >= 1 && u < DW - 1 && v >= 1 && v < DH - 1) {
+                if (useVis && mode == 1) {
+                    val gy = visY[v * DW + u]
+                    val r = (Color.red(col) * 0.5f + gy * 0.5f).toInt().coerceIn(0, 255)
+                    val g = (Color.green(col) * 0.5f + gy * 0.5f).toInt().coerceIn(0, 255)
+                    val b = (Color.blue(col) * 0.5f + gy * 0.5f).toInt().coerceIn(0, 255)
+                    col = Color.rgb(r, g, b)
+                } else if (useVis && mode == 0 && u >= 1 && u < DW - 1 && v >= 1 && v < DH - 1) {
                     val d = ((visY[(v + 1) * DW + u + 1] - visY[(v - 1) * DW + u - 1]) * detail / 160f)
                         .coerceIn(-0.8f, 0.8f)
                     val f = 1f + d
@@ -805,6 +831,36 @@ class MainActivity : Activity() {
             canvas.drawRect(lx - 4f, ly - ts, lx + tw + 4f, ly + ts * 0.3f, paintBg)
             paintText.color = Color.WHITE
             canvas.drawText(labels[i], lx, ly, paintText)
+        }
+        // bar warna + julat
+        var bLo = 0f
+        var bHi = 1f
+        var cal = false
+        synchronized(lock) { bLo = dispLo; bHi = dispHi; cal = calValid }
+        val barW = ts * 0.8f
+        val barX = w - barW - ts * 0.3f
+        val barTop = (h - strip) * 0.12f
+        val barBot = (h - strip) * 0.88f
+        paintBar.style = Paint.Style.FILL
+        for (k in 0 until 64) {
+            val t = 1f - k / 63f
+            paintBar.color = lut[(t * 255f).toInt().coerceIn(0, 255)]
+            val y1 = barTop + (barBot - barTop) * k / 64f
+            val y2 = barTop + (barBot - barTop) * (k + 1) / 64f + 1f
+            canvas.drawRect(barX, y1, barX + barW, y2, paintBar)
+        }
+        paintLine.style = Paint.Style.STROKE
+        paintLine.color = Color.WHITE
+        paintLine.strokeWidth = ts * 0.06f
+        canvas.drawRect(barX, barTop, barX + barW, barBot, paintLine)
+        val hiTxt = if (cal) String.format(Locale.US, "%.1f C", tempFromCounts(bHi)) else bHi.toInt().toString()
+        val loTxt = if (cal) String.format(Locale.US, "%.1f C", tempFromCounts(bLo)) else bLo.toInt().toString()
+        for ((txt, ty) in listOf(Pair(hiTxt, barTop + ts * 0.9f), Pair(loTxt, barBot - ts * 0.2f))) {
+            val tw = paintText.measureText(txt)
+            val tx = barX - tw - 10f
+            canvas.drawRect(tx - 4f, ty - ts, tx + tw + 4f, ty + ts * 0.3f, paintBg)
+            paintText.color = Color.WHITE
+            canvas.drawText(txt, tx, ty, paintText)
         }
         if (forSave && strip > 0) {
             paintText.color = Color.WHITE
