@@ -107,6 +107,9 @@ class MainActivity : Activity() {
     private var reader: ImageReader? = null
 
     private val lut = IntArray(256)
+    @Volatile private var camState = "belum mula"
+    @Volatile private var frameCount = 0
+    @Volatile private var lastErr = ""
 
     private val paintLine = Paint(Paint.ANTI_ALIAS_FLAG)
     private val paintText = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -312,7 +315,9 @@ class MainActivity : Activity() {
     // ------------------------------------------------------------------ kamera
 
     private fun startCamera() {
-        if (camera != null) return
+        if (thread != null) return
+        camState = "membuka kamera 2..."
+        updateStatus()
         thread = HandlerThread("cam").also { it.start() }
         handler = Handler(thread!!.looper)
         val rd = ImageReader.newInstance(W, H, 20 /* YUY2 */, 3)
@@ -321,15 +326,15 @@ class MainActivity : Activity() {
         val mgr = getSystemService(CAMERA_SERVICE) as CameraManager
         try {
             mgr.openCamera("2", object : CameraDevice.StateCallback() {
-                override fun onOpened(cd: CameraDevice) { camera = cd; createSession(cd, rd) }
-                override fun onDisconnected(cd: CameraDevice) { cd.close(); camera = null }
+                override fun onOpened(cd: CameraDevice) { camera = cd; camState = "kamera dibuka"; updateStatus(); createSession(cd, rd) }
+                override fun onDisconnected(cd: CameraDevice) { cd.close(); camera = null; camState = "kamera terputus"; updateStatus() }
                 override fun onError(cd: CameraDevice, error: Int) {
                     cd.close(); camera = null
-                    toast("Ralat kamera thermal: $error")
+                    camState = "RALAT kamera kod $error"; updateStatus()
                 }
             }, handler)
         } catch (e: Exception) {
-            toast("Gagal buka kamera thermal: $e")
+            camState = "GAGAL buka: $e"; updateStatus()
         }
     }
 
@@ -343,11 +348,12 @@ class MainActivity : Activity() {
                         val req = cd.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                         req.addTarget(rd.surface)
                         s.setRepeatingRequest(req.build(), null, handler)
-                    } catch (e: Exception) { toast("Gagal mula streaming: $e") }
+                        camState = "streaming, tunggu frame"; updateStatus()
+                    } catch (e: Exception) { camState = "GAGAL streaming: $e"; updateStatus() }
                 }
-                override fun onConfigureFailed(s: CameraCaptureSession) { toast("Konfigurasi kamera gagal") }
+                override fun onConfigureFailed(s: CameraCaptureSession) { camState = "konfigurasi sesi GAGAL"; updateStatus() }
             }, handler)
-        } catch (e: Exception) { toast("Gagal cipta sesi: $e") }
+        } catch (e: Exception) { camState = "GAGAL cipta sesi: $e"; updateStatus() }
     }
 
     private fun stopCamera() {
@@ -356,6 +362,7 @@ class MainActivity : Activity() {
         try { reader?.close() } catch (_: Exception) {}
         session = null; camera = null; reader = null
         thread?.quitSafely(); thread = null; handler = null
+        camState = "dihentikan"
     }
 
     private fun onImage(r: ImageReader) {
@@ -370,10 +377,12 @@ class MainActivity : Activity() {
                 rawBuf[y * W + x] = if (pos + 1 < buf.limit()) (buf.getShort(pos).toInt() and 0xFFFF) else 0
             }
             processFrame(rawBuf)
+            frameCount++
             thermalView.postInvalidate()
             val now = System.currentTimeMillis()
             if (now - lastStatus > 250) { lastStatus = now; updateStatus() }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            lastErr = e.toString()
         } finally {
             img.close()
         }
@@ -590,6 +599,8 @@ class MainActivity : Activity() {
             else sb.append("belum (").append(samples.size).append(" sampel, perlu 2)")
             sb.append('\n').append(statsLineLocked())
             if (selected >= 0 && selected < points.size) sb.append("  | Dipilih: P").append(selected + 1)
+            sb.append('\n').append("Kamera: ").append(camState).append(" | frame: ").append(frameCount)
+            if (lastErr.isNotEmpty()) sb.append("\nRalat: ").append(lastErr)
             sb.toString()
         }
         mainHandler.post { statusText.text = s }
