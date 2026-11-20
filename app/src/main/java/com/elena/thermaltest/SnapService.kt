@@ -58,6 +58,10 @@ class SnapService : Service() {
         const val CH = "snap"
         @Volatile var running = false
         @Volatile var instance: SnapService? = null
+        /** Gambar yang dihantar ke app PV report (diambil melalui LocalApi). */
+        @Volatile var pendingPng: ByteArray? = null
+        @Volatile var pendingName: String = ""
+        @Volatile var armedUntil = 0L
         const val THERMVUE = "com.infisense.eco"
 
         fun hasUsageAccess(ctx: android.content.Context): Boolean {
@@ -87,6 +91,7 @@ class SnapService : Service() {
     private var fgOk = true
     private var lastPoll = 0L
     private var pendingThermal: Bitmap? = null
+    private var api: LocalApi? = null
     private val poller = object : Runnable {
         override fun run() {
             pollForeground()
@@ -117,6 +122,7 @@ class SnapService : Service() {
             showButton()
             running = true
             instance = this
+            api = LocalApi().also { it.start() }
             if (hasUsageAccess(this)) {
                 fgOk = false
                 lastPoll = System.currentTimeMillis() - 15000
@@ -265,6 +271,25 @@ class SnapService : Service() {
             startActivity(i)
         } catch (e: Exception) {
             toast("Tak dapat buka galeri: $e")
+        }
+    }
+
+    /** Dipanggil oleh app PV report: sedia terima gambar SNAP seterusnya dan (pilihan) buka ThermVue. */
+    fun apiArm(open: Boolean) {
+        pendingPng = null
+        armedUntil = System.currentTimeMillis() + 10 * 60 * 1000L
+        if (!open) return
+        main.post {
+            // butang terapung dipaparkan sebentar supaya Android benarkan buka ThermVue dari latar belakang
+            fgOk = true
+            applyVisibility()
+            main.postDelayed({
+                val li = packageManager.getLaunchIntentForPackage(THERMVUE)
+                if (li != null) {
+                    li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    try { startActivity(li) } catch (_: Exception) {}
+                }
+            }, 250)
         }
     }
 
@@ -444,6 +469,14 @@ class SnapService : Service() {
         contentResolver.openOutputStream(uri)!!.use { os -> out.compress(Bitmap.CompressFormat.PNG, 100, os) }
         lastUri = uri
         sp.edit().putString("lastUri", uri.toString()).apply()
+        if (System.currentTimeMillis() < armedUntil) {
+            val bo = java.io.ByteArrayOutputStream()
+            out.compress(Bitmap.CompressFormat.PNG, 100, bo)
+            pendingName = name
+            pendingPng = bo.toByteArray()
+            armedUntil = 0L
+            toast("Gambar dihantar ke app PV report. Kembali ke app tu.")
+        }
         return name
     }
 
@@ -471,6 +504,8 @@ class SnapService : Service() {
     override fun onDestroy() {
         running = false
         instance = null
+        api?.stop(); api = null
+        pendingPng = null; armedUntil = 0L
         main.removeCallbacks(poller)
         try { bar?.let { wm?.removeView(it) } } catch (_: Exception) {}
         button = null; bar = null; thumb = null

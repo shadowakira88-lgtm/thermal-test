@@ -133,6 +133,11 @@ class SnapActivity : Activity() {
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 2)
         }
+        // dibuka dari app PV report (thermalsnap://start): mula SNAP terus
+        if (intent?.data?.scheme == "thermalsnap") {
+            start()
+            if (SnapService.running) finish()
+        }
     }
 
     override fun onResume() {
