@@ -63,7 +63,10 @@ class SnapActivity : Activity() {
         btn("1. Benarkan papar di atas app lain") {
             startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
         }
-        btn("2. Mula SNAP dan buka ThermVue") { start() }
+        btn("2. Benarkan akses penggunaan (SNAP hanya muncul dalam ThermVue)") {
+            try { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) } catch (_: Exception) {}
+        }
+        btn("3. Mula SNAP dan buka ThermVue") { start() }
         btn("Buka ThermVue sahaja") { openThermVue() }
         btn("Henti SNAP") {
             stopService(Intent(this, SnapService::class.java))
@@ -82,6 +85,21 @@ class SnapActivity : Activity() {
             text = "Tambah tarikh dan masa di bawah gambar"
             isChecked = sp.getBoolean("stamp", false)
             setOnCheckedChangeListener { _, c -> sp.edit().putBoolean("stamp", c).apply() }
+        })
+        root.addView(CheckBox(this).apply {
+            text = "Gabung gambar kamera biasa (RGB) di sebelah gambar haba"
+            isChecked = sp.getBoolean("rgb", false)
+            setOnCheckedChangeListener { _, c ->
+                sp.edit().putBoolean("rgb", c).apply()
+                if (c && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(arrayOf(Manifest.permission.CAMERA), 3)
+                }
+            }
+        })
+        root.addView(CheckBox(this).apply {
+            text = "Susun RGB di bawah (bukan di sebelah)"
+            isChecked = sp.getBoolean("stack", false)
+            setOnCheckedChangeListener { _, c -> sp.edit().putBoolean("stack", c).apply() }
         })
         fun slider(label: String, key: String, def: Float, maxPct: Int) {
             val t = TextView(this).apply { textSize = 13f }
@@ -126,6 +144,7 @@ class SnapActivity : Activity() {
         val ov = Settings.canDrawOverlays(this)
         val installed = packageManager.getLaunchIntentForPackage(THERMVUE) != null
         status.text = "Kebenaran papar atas app: " + (if (ov) "OK" else "BELUM (tekan butang 1)") +
+            "\nAkses penggunaan: " + (if (SnapService.hasUsageAccess(this)) "OK (SNAP hanya dalam ThermVue)" else "BELUM (SNAP muncul di semua app)") +
             "\nThermVue: " + (if (installed) "dijumpai" else "tidak dijumpai") +
             "\nSNAP: " + (if (SnapService.running) "sedang jalan" else "tidak jalan")
     }

@@ -4,7 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.app.AppOpsManager
 import android.app.Service
+import android.app.usage.UsageEvents
+import android.app.usage.UsageStatsManager
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -43,6 +46,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.max
 
 /** Servis latar depan: rakam skrin (MediaProjection) + butang SNAP terapung. */
 class SnapService : Service() {
@@ -53,6 +57,15 @@ class SnapService : Service() {
         const val ACTION_STOP = "stop"
         const val CH = "snap"
         @Volatile var running = false
+        @Volatile var instance: SnapService? = null
+        const val THERMVUE = "com.infisense.eco"
+
+        fun hasUsageAccess(ctx: android.content.Context): Boolean {
+            val ao = ctx.getSystemService(APP_OPS_SERVICE) as AppOpsManager
+            @Suppress("DEPRECATION")
+            val m = ao.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), ctx.packageName)
+            return m == AppOpsManager.MODE_ALLOWED
+        }
     }
 
     private val main = Handler(Looper.getMainLooper())
@@ -70,6 +83,16 @@ class SnapService : Service() {
     private var sw = 0
     private var sh = 0
     private var busy = false
+    private var hiddenForCapture = false
+    private var fgOk = true
+    private var lastPoll = 0L
+    private var pendingThermal: Bitmap? = null
+    private val poller = object : Runnable {
+        override fun run() {
+            pollForeground()
+            main.postDelayed(this, 700)
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -93,6 +116,13 @@ class SnapService : Service() {
             startCapture(mp)
             showButton()
             running = true
+            instance = this
+            if (hasUsageAccess(this)) {
+                fgOk = false
+                lastPoll = System.currentTimeMillis() - 15000
+                applyVisibility()
+                main.post(poller)
+            }
         } catch (e: Exception) {
             toast("Gagal mula: $e")
             stopSelf()
@@ -238,40 +268,128 @@ class SnapService : Service() {
         }
     }
 
+    private fun applyVisibility() {
+        bar?.visibility = if (!hiddenForCapture && fgOk) View.VISIBLE else View.GONE
+    }
+
+    /** Papar butang hanya bila ThermVue di depan (perlu akses penggunaan). */
+    private fun pollForeground() {
+        try {
+            val um = getSystemService(USAGE_STATS_SERVICE) as UsageStatsManager
+            val now = System.currentTimeMillis()
+            val ev = um.queryEvents(lastPoll - 1000, now)
+            lastPoll = now
+            val e = UsageEvents.Event()
+            var top: String? = null
+            while (ev.hasNextEvent()) {
+                ev.getNextEvent(e)
+                if (e.eventType == UsageEvents.Event.ACTIVITY_RESUMED) top = e.packageName
+            }
+            if (top != null) {
+                val ok = top == THERMVUE
+                if (ok != fgOk) { fgOk = ok; applyVisibility() }
+            }
+        } catch (_: Exception) {}
+    }
+
     private fun snap() {
         if (busy) return
         busy = true
-        bar?.visibility = View.INVISIBLE
+        hiddenForCapture = true
+        applyVisibility()
         // tunggu skrin dilukis semula tanpa butang
         bg?.postDelayed({
             val img = latest
             latest = null
-            var ok = false
-            var name = ""
+            var thermal: Bitmap? = null
             if (img != null) {
                 try {
-                    val bmp = crop(toBitmap(img))
-                    val small = Bitmap.createScaledBitmap(bmp, bmp.width / 6, bmp.height / 6, true)
-                    name = save(bmp)
-                    ok = true
-                    main.post { thumb?.setImageBitmap(small) }
+                    thermal = crop(toBitmap(img))
                 } catch (e: Exception) {
-                    toast("Simpan gagal: $e")
+                    toast("Tangkap gagal: $e")
                 } finally {
                     img.close()
                 }
             } else {
                 toast("Tiada imej skrin lagi. Cuba sekali lagi.")
             }
-            main.post {
-                bar?.visibility = View.VISIBLE
-                busy = false
-                if (ok) {
-                    button?.text = "OK"
-                    main.postDelayed({ button?.text = "SNAP" }, 900)
+            val rgb = getSharedPreferences("snap", MODE_PRIVATE).getBoolean("rgb", false)
+            if (thermal != null && rgb) {
+                pendingThermal = thermal
+                main.post {
+                    try {
+                        startActivity(Intent(this, RgbActivity::class.java)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION))
+                    } catch (e: Exception) {
+                        bg?.post { onRgb(null) }
+                    }
                 }
+            } else {
+                finishSnap(thermal)
             }
         }, 400)
+    }
+
+    /** Dipanggil oleh RgbActivity (null jika kamera biasa gagal). */
+    fun onRgb(rgb: Bitmap?) {
+        bg?.post {
+            val t = pendingThermal
+            pendingThermal = null
+            if (t == null) { finishSnap(null); return@post }
+            if (rgb == null) {
+                toast("Kamera biasa gagal, gambar haba sahaja disimpan.")
+                finishSnap(t)
+            } else {
+                finishSnap(combine(t, rgb))
+            }
+        }
+    }
+
+    private fun combine(t: Bitmap, r: Bitmap): Bitmap {
+        val vertical = getSharedPreferences("snap", MODE_PRIVATE).getBoolean("stack", false)
+        val gap = (t.width * 0.01f).toInt().coerceAtLeast(6)
+        return if (vertical) {
+            val rh = r.height * t.width / r.width
+            val rs = Bitmap.createScaledBitmap(r, t.width, rh, true)
+            val out = Bitmap.createBitmap(t.width, t.height + gap + rh, Bitmap.Config.ARGB_8888)
+            val c = Canvas(out)
+            c.drawColor(Color.BLACK)
+            c.drawBitmap(t, 0f, 0f, null)
+            c.drawBitmap(rs, 0f, (t.height + gap).toFloat(), null)
+            out
+        } else {
+            val rw = r.width * t.height / r.height
+            val rs = Bitmap.createScaledBitmap(r, rw, t.height, true)
+            val out = Bitmap.createBitmap(t.width + gap + rw, t.height, Bitmap.Config.ARGB_8888)
+            val c = Canvas(out)
+            c.drawColor(Color.BLACK)
+            c.drawBitmap(t, 0f, 0f, null)
+            c.drawBitmap(rs, (t.width + gap).toFloat(), 0f, null)
+            out
+        }
+    }
+
+    private fun finishSnap(bmp: Bitmap?) {
+        var ok = false
+        if (bmp != null) {
+            try {
+                save(bmp)
+                val small = Bitmap.createScaledBitmap(bmp, max(1, bmp.width / 6), max(1, bmp.height / 6), true)
+                ok = true
+                main.post { thumb?.setImageBitmap(small) }
+            } catch (e: Exception) {
+                toast("Simpan gagal: $e")
+            }
+        }
+        main.post {
+            hiddenForCapture = false
+            applyVisibility()
+            busy = false
+            if (ok) {
+                button?.text = "OK"
+                main.postDelayed({ button?.text = "SNAP" }, 900)
+            }
+        }
     }
 
     private fun toBitmap(img: Image): Bitmap {
@@ -352,6 +470,8 @@ class SnapService : Service() {
 
     override fun onDestroy() {
         running = false
+        instance = null
+        main.removeCallbacks(poller)
         try { bar?.let { wm?.removeView(it) } } catch (_: Exception) {}
         button = null; bar = null; thumb = null
         try { vd?.release() } catch (_: Exception) {}
