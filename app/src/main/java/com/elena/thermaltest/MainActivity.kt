@@ -46,6 +46,7 @@ import java.util.zip.ZipOutputStream
  * tunjuk frame mentah, dan simpan frame + maklumat penuh ke ZIP dalam Download/ThermalTest.
  */
 class MainActivity : Activity() {
+    // v0.2: lalai kepada YUY2 160x120 (format yang ThermVue guna untuk modul thermal)
 
     private data class Option(val format: Int, val w: Int, val h: Int) {
         override fun toString() = "${formatName(format)}  ${w}x$h"
@@ -171,7 +172,7 @@ class MainActivity : Activity() {
                     for (s in sizes) list.add(Option(f, s.width, s.height))
                 }
             }
-            options = list.sortedWith(compareBy({ if (it.format == 35) 0 else 1 }, { it.format }, { -it.w }))
+            options = list.sortedWith(compareBy({ if (it.format == 20) 0 else if (it.format == 35) 1 else 2 }, { it.format }, { -it.w }))
             spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, options)
             currentOption = options.firstOrNull()
             log("Camera $id: ${options.size} pilihan format/saiz dijumpai.")
@@ -303,7 +304,7 @@ class MainActivity : Activity() {
         }
 
         val is16 = opt.format == 540422489 /* Y16 */ || opt.format == 32 /* RAW_SENSOR */ ||
-            opt.format == 0x20363159
+            opt.format == 20 /* YUY2: ThermVue guna ini, data suhu 16-bit */
         val vals = IntArray(w * h)
         var mn = Int.MAX_VALUE
         var mx = Int.MIN_VALUE
